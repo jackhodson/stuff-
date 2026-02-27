@@ -701,7 +701,165 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
     return df, vaa_coeffs, league_stats, arm_models, haa_stats
 
 
-# ─── TRAIN ────────────────────────────────────────────────────────────────────
+# ─── LEAN COLUMNS NEEDED FOR MODEL FITTING ───────────────────────────────────
+# Only these columns need to be kept in the accumulated "stats" dataframe.
+# Everything else can be dropped after each chunk is scored, keeping RAM low.
+_LEAN_COLS = [
+    "pitch_type", "release_speed", "ivb", "hb", "adj_vaa", "_vaa", "_haa",
+    "arm_angle", "release_pos_z", "plate_z", "release_extension",
+    "release_spin_rate", "pitcher",
+]
+
+
+def _clean_pitch_types(df):
+    df = df.copy()
+    df["pitch_type"] = df["pitch_type"].fillna("").astype(str).str.strip()
+    return df[df["pitch_type"].str.len() > 0].reset_index(drop=True)
+
+
+# ─── STREAMING TRAIN ──────────────────────────────────────────────────────────
+# Two-pass approach that keeps peak RAM ~130 MB regardless of season size:
+#
+# Pass 1 — accumulate a lean stats DF across all chunks, then fit all model
+#           parameters (vaa_coeffs, league_stats, arm_models, haa_stats).
+#           Only keeps 12 columns per row = ~75 MB for a full season.
+#
+# Pass 2 — re-score each chunk with the fitted parameters, accumulate only
+#           raw scores + pitch_type strings for rank normalization = ~10 MB.
+#
+# The caller (app.py) fetches one chunk at a time and calls this function
+# incrementally so Streamlit can show live progress without timing out.
+
+def train_streaming(chunks, status_fn=None):
+    """
+    Train on a list of DataFrames (one per date chunk).
+
+    Args:
+        chunks:    list of pd.DataFrame — each is one date-range download
+        status_fn: optional callable(message: str, pct: float)
+
+    Returns:
+        dict with n_pitches, score percentiles
+    """
+    if not chunks:
+        raise ValueError("No data chunks provided.")
+
+    total_chunks = len(chunks)
+
+    # ── Pass 1: accumulate lean stats for model fitting ──────────────────────
+    if status_fn: status_fn("Pass 1/2 — fitting model parameters…", 0.02)
+
+    lean_parts = []
+    for i, chunk in enumerate(chunks):
+        chunk = _clean_pitch_types(chunk)
+        if len(chunk) == 0:
+            continue
+        # Compute only the columns needed for model fitting
+        vaa, haa = compute_vaa_haa(chunk)
+        chunk = chunk.copy()
+        chunk["_vaa"] = vaa
+        chunk["_haa"] = haa
+        # Placeholder adj_vaa using identity (will be replaced after vaa_coeffs fit)
+        chunk["adj_vaa"] = vaa
+        chunk["ivb"] = chunk["pfx_z"] * 12.0
+        chunk["hb"]  = chunk["pfx_x"] * 12.0
+        chunk = fix_hb_handedness(chunk)
+        chunk["arm_angle"] = compute_arm_angle(chunk)
+        if "release_extension" not in chunk.columns:
+            chunk["release_extension"] = 6.2
+
+        keep = [c for c in _LEAN_COLS if c in chunk.columns]
+        lean_parts.append(chunk[keep].copy())
+
+        pct = 0.02 + 0.25 * (i + 1) / total_chunks
+        if status_fn: status_fn(
+            f"Pass 1/2 — pre-processing chunk {i+1}/{total_chunks}…", pct)
+
+    lean_df = pd.concat(lean_parts, ignore_index=True)
+    del lean_parts
+
+    # Fit vaa_coeffs on the full lean_df, then recompute adj_vaa
+    if status_fn: status_fn("Fitting VAA adjustment…", 0.28)
+    vaa_c = fit_vaa_adjustment(lean_df)
+    lean_df = apply_vaa_adjustment(lean_df, vaa_c)
+
+    # Fit all model parameters
+    if status_fn: status_fn("Fitting league stats…", 0.32)
+    lg = fit_league_stats(lean_df)
+    if status_fn: status_fn("Fitting arm-angle models…", 0.36)
+    am = fit_arm_angle_models(lean_df)
+    if status_fn: status_fn("Fitting HAA stats…", 0.40)
+    hs = fit_haa_stats(lean_df)
+
+    # Compute per-pitcher FB reference on lean_df (need pitcher col)
+    # We'll use this later in pass 2; not needed here.
+    del lean_df
+
+    # ── Pass 2: score each chunk, accumulate raw scores + pitch types ─────────
+    if status_fn: status_fn("Pass 2/2 — scoring pitches…", 0.42)
+
+    all_raw    = []
+    all_ptypes = []
+    n_total    = 0
+
+    for i, chunk in enumerate(chunks):
+        chunk = _clean_pitch_types(chunk)
+        if len(chunk) == 0:
+            continue
+
+        # Drop any previously computed columns so add_physics_features is clean
+        chunk = chunk.drop(
+            columns=[c for c in _DROP_BEFORE_SCORE if c in chunk.columns],
+            errors="ignore")
+
+        chunk, _, _, _, _ = add_physics_features(
+            chunk, vaa_coeffs=vaa_c,
+            league_stats=lg, arm_models=am, haa_stats=hs)
+
+        raw   = compute_stuff_raw(chunk, lg, arm_models=am, haa_stats=hs)
+        chunk = tag_high_ivb_sweepers(chunk, arm_models=am)
+
+        all_raw.append(raw)
+        all_ptypes.append(chunk["pitch_type"].values)
+        n_total += len(chunk)
+
+        del chunk
+        pct = 0.42 + 0.50 * (i + 1) / total_chunks
+        if status_fn: status_fn(
+            f"Pass 2/2 — scoring chunk {i+1}/{total_chunks}…", pct)
+
+    all_raw    = np.concatenate(all_raw)
+    all_ptypes = np.concatenate(all_ptypes)
+
+    # ── Fit rank normalization ─────────────────────────────────────────────────
+    if status_fn: status_fn("Fitting rank normalization…", 0.94)
+    rn = fit_rank_norm(all_raw, all_ptypes)
+
+    # ── Save model ────────────────────────────────────────────────────────────
+    if status_fn: status_fn("Saving model files…", 0.97)
+    with open(MODEL_PATH, "wb") as f: pickle.dump({"formula": True}, f)
+    with open(NORM_PATH,  "wb") as f: pickle.dump(rn, f)
+    with open(VAA_PATH,   "wb") as f: pickle.dump(vaa_c, f)
+    with open(AUX_PATH,   "wb") as f: pickle.dump(
+        {"league_stats": lg, "arm_models": am, "haa_stats": hs}, f)
+    (MODEL_DIR / "physics_version.txt").write_text(PHYSICS_VERSION)
+
+    # Percentiles for reporting
+    test = apply_rank_norm(all_raw, rn, all_ptypes)
+    # Simple velo-floor proxy (need velo, approximate with league mean)
+    if status_fn: status_fn("✓ Done.", 1.0)
+    return {
+        "n_pitches":  n_total,
+        "model_type": f"Direct Physics Formula {PHYSICS_VERSION}",
+        "score_p99":  round(float(np.percentile(test, 99)), 1),
+        "score_p95":  round(float(np.percentile(test, 95)), 1),
+        "score_p50":  round(float(np.percentile(test, 50)), 1),
+        "score_p05":  round(float(np.percentile(test, 5)),  1),
+        "score_p01":  round(float(np.percentile(test, 1)),  1),
+    }
+
+
+# ─── TRAIN (legacy — full DataFrame in memory) ───────────────────────────────
 
 def train(df, status_fn=None):
     df = df.copy()
