@@ -4,6 +4,12 @@ app.py - Pitcher Player Card Dashboard
 Uses model_trainer.py for physics-formula Stuff+ scoring.
 Model ships pre-trained (pickle files in data/model/).
 Supports live Savant API lookup and CSV upload.
+
+FIXES:
+  - All "tjStuff+" labels → "Stuff+"
+  - Movement plot: HB axis labeled arm side / glove side (handedness-aware)
+  - Movement plot: arm angle derived correctly from release position
+  - Pitcher search dropdown for autocomplete
 """
 
 import streamlit as st
@@ -14,11 +20,12 @@ import math
 from datetime import datetime
 
 from data_fetcher import (
-    fetch_season, fetch_pitcher_season, fetch_pitcher_live, search_pitcher,
+    fetch_pitcher_season, fetch_pitcher_live, search_pitcher,
+    season_chunk_schedule, fetch_chunk, clear_chunk_cache,
 )
 from metrics import (
-    model_is_trained, train_model, score_pitches, score_from_csv,
-    build_pitcher_summary, PITCH_NAMES,
+    model_is_trained, train_model, train_model_streaming, score_pitches,
+    score_from_csv, build_pitcher_summary, PITCH_NAMES,
 )
 import model_trainer
 
@@ -81,41 +88,92 @@ def stuff_css(val):
 # ── Charts ────────────────────────────────────────────────────────────────────
 
 def make_movement_plot(mvmt, arm_angle, hand):
+    """
+    Movement plot with correct HB orientation:
+      - X axis: arm side (positive) on the right, glove side on the left
+      - Arm angle line derived from the corrected arm_angle value
+      - Axis labels reflect the pitcher's handedness
+    """
     fig = go.Figure()
-    for r in [5,10,15,20,25]:
-        t = np.linspace(0, 2*np.pi, 120)
-        fig.add_trace(go.Scatter(x=r*np.cos(t), y=r*np.sin(t), mode='lines',
-            line=dict(color='rgba(33,38,45,0.7)', width=1), showlegend=False, hoverinfo='skip'))
+
+    # Reference circles
+    for r in [5, 10, 15, 20, 25]:
+        t = np.linspace(0, 2 * np.pi, 120)
+        fig.add_trace(go.Scatter(
+            x=r * np.cos(t), y=r * np.sin(t), mode='lines',
+            line=dict(color='rgba(33,38,45,0.7)', width=1),
+            showlegend=False, hoverinfo='skip'))
+
     fig.add_hline(y=0, line_color='rgba(48,54,61,0.6)', line_width=1)
     fig.add_vline(x=0, line_color='rgba(48,54,61,0.6)', line_width=1)
-    for deg, lbl in {0:'12',90:'3',180:'6',270:'9'}.items():
-        rad = math.radians(90-deg)
-        fig.add_annotation(x=27*math.cos(rad), y=27*math.sin(rad), text=lbl,
-            font=dict(size=11, color='#484f58', family='JetBrains Mono'), showarrow=False)
-    arad = math.radians(90-arm_angle)
-    fig.add_trace(go.Scatter(x=[0,23*math.cos(arad)], y=[0,23*math.sin(arad)],
-        mode='lines', line=dict(color='#ffa657', width=2, dash='dot'),
+
+    # Clock labels
+    for deg, lbl in {0: '12', 90: '3', 180: '6', 270: '9'}.items():
+        rad = math.radians(90 - deg)
+        fig.add_annotation(
+            x=27 * math.cos(rad), y=27 * math.sin(rad), text=lbl,
+            font=dict(size=11, color='#484f58', family='JetBrains Mono'),
+            showarrow=False)
+
+    # Arm angle line.
+    # arm_angle is now degrees from horizontal (0=sidearm, 90=over-top),
+    # corrected for handedness. We draw it on the arm-side (right side of plot
+    # since HB is arm-side positive).
+    # Convert: 0° arm angle = 9-o'clock direction = 180° standard angle
+    # As arm_angle increases toward 90° (over-top), line rotates toward 12 o'clock.
+    # The line should always point toward the arm-side half of the plot (+x).
+    line_angle_rad = math.radians(arm_angle)  # from horizontal
+    lx = 23 * math.cos(line_angle_rad)
+    ly = 23 * math.sin(line_angle_rad)
+    fig.add_trace(go.Scatter(
+        x=[0, lx], y=[0, ly], mode='lines',
+        line=dict(color='#ffa657', width=2, dash='dot'),
         showlegend=False, hoverinfo='skip'))
+
+    # Pitch scatter — hb is already arm-side-positive in the data
     for pt in mvmt['pitch_type'].unique():
-        if pd.isna(pt): continue
-        s = mvmt[mvmt['pitch_type']==pt]; c = PITCH_COLORS.get(pt,'#7d8590')
+        if pd.isna(pt):
+            continue
+        s = mvmt[mvmt['pitch_type'] == pt]
+        c = PITCH_COLORS.get(pt, '#7d8590')
         nm = PITCH_NAMES.get(pt, pt)
-        fig.add_trace(go.Scatter(x=s['hb'], y=s['ivb'], mode='markers', name=nm,
+        fig.add_trace(go.Scatter(
+            x=s['hb'], y=s['ivb'], mode='markers', name=nm,
             marker=dict(size=6, color=c, opacity=0.7,
                         line=dict(width=0.4, color='rgba(0,0,0,0.4)')),
             hovertemplate=f'<b>{nm}</b><br>HB: %{{x:.1f}}"<br>iVB: %{{y:.1f}}"<extra></extra>'))
+
+    # Axis labels — arm side is always right (+x), glove side always left (-x)
+    arm_label  = "Arm Side →"
+    glove_label = "← Glove Side"
+
     fig.update_layout(
         template='plotly_dark', paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
         font=dict(family='JetBrains Mono', color='#7d8590', size=10),
-        title=dict(text='<b>Pitch Movement</b>', font=dict(size=14, color='#e6edf3', family='DM Sans'), x=0.01, y=0.98),
-        xaxis=dict(title='Horizontal Break (in)', range=[-28,28], zeroline=False, gridcolor='rgba(33,38,45,0.3)', dtick=10),
-        yaxis=dict(title='Induced Vert. Break (in)', range=[-28,28], zeroline=False, gridcolor='rgba(33,38,45,0.3)', dtick=10, scaleanchor='x', scaleratio=1),
-        legend=dict(orientation='h', y=-0.17, x=0.5, xanchor='center', font=dict(size=9), bgcolor='rgba(0,0,0,0)'),
-        margin=dict(l=50,r=15,t=42,b=55), height=500, width=500,
-        annotations=[dict(x=0.98,y=0.02,xref='paper',yref='paper',
-            text=f'<b>Arm Angle: {arm_angle}°</b>', font=dict(size=10, color='#ffa657', family='JetBrains Mono'),
-            showarrow=False, bgcolor='rgba(13,17,23,0.85)', bordercolor='#ffa657',
-            borderwidth=1, borderpad=4, xanchor='right', yanchor='bottom')])
+        title=dict(
+            text='<b>Pitch Movement</b>',
+            font=dict(size=14, color='#e6edf3', family='DM Sans'), x=0.01, y=0.98),
+        xaxis=dict(
+            title=f'{glove_label}  |  {arm_label}',
+            range=[-28, 28], zeroline=False,
+            gridcolor='rgba(33,38,45,0.3)', dtick=10),
+        yaxis=dict(
+            title='Induced Vert. Break (in)',
+            range=[-28, 28], zeroline=False,
+            gridcolor='rgba(33,38,45,0.3)', dtick=10,
+            scaleanchor='x', scaleratio=1),
+        legend=dict(
+            orientation='h', y=-0.17, x=0.5, xanchor='center',
+            font=dict(size=9), bgcolor='rgba(0,0,0,0)'),
+        margin=dict(l=50, r=15, t=42, b=55),
+        height=500, width=500,
+        annotations=[dict(
+            x=0.98, y=0.02, xref='paper', yref='paper',
+            text=f'<b>Arm Angle: {arm_angle}°</b>',
+            font=dict(size=10, color='#ffa657', family='JetBrains Mono'),
+            showarrow=False, bgcolor='rgba(13,17,23,0.85)',
+            bordercolor='#ffa657', borderwidth=1, borderpad=4,
+            xanchor='right', yanchor='bottom')])
     return fig
 
 
@@ -125,61 +183,87 @@ def make_usage_chart(usage_lhh, usage_rhh, header_df):
     lvals = [usage_lhh.get(pt, 0) for pt in pts]
     rvals = [usage_rhh.get(pt, 0) for pt in pts]
     fig = go.Figure()
-    fig.add_trace(go.Bar(y=labels, x=[-v for v in lvals], orientation='h', name='vs LHH',
-        marker_color=[PITCH_COLORS.get(pt,'#7d8590') for pt in pts], opacity=0.85,
-        text=[f'{v}%' if v>2 else '' for v in lvals], textposition='inside',
+    fig.add_trace(go.Bar(
+        y=labels, x=[-v for v in lvals], orientation='h', name='vs LHH',
+        marker_color=[PITCH_COLORS.get(pt, '#7d8590') for pt in pts], opacity=0.85,
+        text=[f'{v}%' if v > 2 else '' for v in lvals], textposition='inside',
         textfont=dict(size=10, color='white', family='JetBrains Mono')))
-    fig.add_trace(go.Bar(y=labels, x=rvals, orientation='h', name='vs RHH',
-        marker_color=[PITCH_COLORS.get(pt,'#7d8590') for pt in pts], opacity=0.5,
-        text=[f'{v}%' if v>2 else '' for v in rvals], textposition='inside',
+    fig.add_trace(go.Bar(
+        y=labels, x=rvals, orientation='h', name='vs RHH',
+        marker_color=[PITCH_COLORS.get(pt, '#7d8590') for pt in pts], opacity=0.5,
+        text=[f'{v}%' if v > 2 else '' for v in rvals], textposition='inside',
         textfont=dict(size=10, color='white', family='JetBrains Mono')))
     mx = max(max(lvals, default=0), max(rvals, default=0), 10) * 1.2
     fig.update_layout(
         template='plotly_dark', paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
         font=dict(family='JetBrains Mono', color='#7d8590'),
-        title=dict(text='<b>Pitch Usage — LHH vs RHH</b>', font=dict(size=14, color='#e6edf3', family='DM Sans'), x=0.01, y=0.98),
+        title=dict(
+            text='<b>Pitch Usage — LHH vs RHH</b>',
+            font=dict(size=14, color='#e6edf3', family='DM Sans'), x=0.01, y=0.98),
         barmode='overlay',
-        xaxis=dict(range=[-mx,mx], zeroline=True, zerolinecolor='#30363d', zerolinewidth=2,
-            tickvals=list(range(-60,70,20)), ticktext=[f'{abs(v)}%' for v in range(-60,70,20)],
+        xaxis=dict(
+            range=[-mx, mx], zeroline=True, zerolinecolor='#30363d', zerolinewidth=2,
+            tickvals=list(range(-60, 70, 20)),
+            ticktext=[f'{abs(v)}%' for v in range(-60, 70, 20)],
             gridcolor='rgba(33,38,45,0.3)'),
         yaxis=dict(autorange='reversed'),
-        legend=dict(orientation='h', y=-0.12, x=0.5, xanchor='center', font=dict(size=9), bgcolor='rgba(0,0,0,0)'),
-        margin=dict(l=100,r=15,t=42,b=45), height=max(260, len(pts)*48+90))
+        legend=dict(
+            orientation='h', y=-0.12, x=0.5, xanchor='center',
+            font=dict(size=9), bgcolor='rgba(0,0,0,0)'),
+        margin=dict(l=100, r=15, t=42, b=45),
+        height=max(260, len(pts) * 48 + 90))
     return fig
 
 
 # ── Table Renderers ───────────────────────────────────────────────────────────
 
 def render_header_table(hdf):
-    cols = ['Pitch','Count','Pitch%','Velocity','iVB','HB','Spin','VAA','HAA','vRel','hRel','Ext.','Axis','tjStuff+']
+    cols = ['Pitch', 'Count', 'Pitch%', 'Velocity', 'iVB', 'HB', 'Spin',
+            'VAA', 'HAA', 'vRel', 'hRel', 'Ext.', 'Axis (Clock)', 'Stuff+']
     h = '<table class="ptable"><thead><tr>'
-    for c in cols: h += f'<th>{c}</th>'
+    for c in cols:
+        h += f'<th>{c}</th>'
     h += '</tr></thead><tbody>'
     for _, r in hdf.iterrows():
-        pt = r.get('pt_code',''); clr = PITCH_COLORS.get(pt,'#7d8590')
+        pt = r.get('pt_code', '')
+        clr = PITCH_COLORS.get(pt, '#7d8590')
         h += '<tr>'
         for c in cols:
-            v = r.get(c, chr(8212))
-            if c == 'Pitch': h += f'<td><span class="pdot" style="background:{clr}"></span>{v}</td>'
-            elif c == 'tjStuff+': h += f'<td class="{stuff_css(v)}">{v}</td>'
-            else: h += f'<td>{v}</td>'
+            # Map display column name to data column name
+            data_key = 'tjStuff+' if 'tjStuff+' in r.index else 'Stuff+'
+            if c == 'Axis (Clock)':
+                v = r.get('Axis', chr(8212))
+            elif c == 'Stuff+':
+                v = r.get(data_key, chr(8212))
+            else:
+                v = r.get(c, chr(8212))
+            if c == 'Pitch':
+                h += f'<td><span class="pdot" style="background:{clr}"></span>{v}</td>'
+            elif c == 'Stuff+':
+                h += f'<td class="{stuff_css(v)}">{v}</td>'
+            else:
+                h += f'<td>{v}</td>'
         h += '</tr>'
     h += '</tbody></table>'
     return h
 
 
 def render_metrics_table(mdf):
-    cols = ['Pitch','Zone%','Chase%','Whiff%','xwOBA']
+    cols = ['Pitch', 'Zone%', 'Chase%', 'Whiff%', 'xwOBA']
     h = '<table class="ptable"><thead><tr>'
-    for c in cols: h += f'<th>{c}</th>'
+    for c in cols:
+        h += f'<th>{c}</th>'
     h += '</tr></thead><tbody>'
     for _, r in mdf.iterrows():
-        pt = r.get('pt_code',''); clr = PITCH_COLORS.get(pt,'#7d8590')
+        pt = r.get('pt_code', '')
+        clr = PITCH_COLORS.get(pt, '#7d8590')
         h += '<tr>'
         for c in cols:
             v = r.get(c, chr(8212))
-            if c == 'Pitch': h += f'<td><span class="pdot" style="background:{clr}"></span>{v}</td>'
-            else: h += f'<td>{v}</td>'
+            if c == 'Pitch':
+                h += f'<td><span class="pdot" style="background:{clr}"></span>{v}</td>'
+            else:
+                h += f'<td>{v}</td>'
         h += '</tr>'
     h += '</tbody></table>'
     return h
@@ -194,8 +278,10 @@ def render_card(summary, model_label):
     <div class="hero">
         <div><div class="hero-name">{s['pitcher_name']}</div>
         <div class="hero-sub">{hand} · {s['total_pitches']:,} pitches · {model_label}</div></div>
-        <div class="stuff-badge"><div class="stuff-label">Overall tjStuff+</div>
-        <div class="stuff-val">{s['overall_stuff']}</div></div>
+        <div class="stuff-badge">
+            <div class="stuff-label">Overall Stuff+</div>
+            <div class="stuff-val">{s['overall_stuff']}</div>
+        </div>
     </div>''', unsafe_allow_html=True)
 
     st.markdown(f'''
@@ -204,32 +290,36 @@ def render_card(summary, model_label):
         <div class="pill"><div class="pill-val">{s['overall_chase']}%</div><div class="pill-lbl">Chase%</div></div>
         <div class="pill"><div class="pill-val">{s['overall_whiff']}%</div><div class="pill-lbl">Whiff%</div></div>
         <div class="pill"><div class="pill-val">{s['overall_xwoba']}</div><div class="pill-lbl">xwOBA Contact</div></div>
-        <div class="pill"><div class="pill-val">{s['overall_stuff']}</div><div class="pill-lbl">tjStuff+</div></div>
+        <div class="pill"><div class="pill-val">{s['overall_stuff']}</div><div class="pill-lbl">Stuff+</div></div>
     </div>''', unsafe_allow_html=True)
 
-    st.markdown('<div class="card"><div class="card-hdr"><span class="dot"></span>Pitch Arsenal</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><div class="card-hdr"><span class="dot"></span>Pitch Arsenal</div>',
+                unsafe_allow_html=True)
     st.markdown(render_header_table(s['header_table']), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     c1, c2 = st.columns([1, 1])
     with c1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.plotly_chart(make_movement_plot(s['movement_data'], s['arm_angle'], s['pitcher_hand']),
-                        use_container_width=True)
+        st.plotly_chart(
+            make_movement_plot(s['movement_data'], s['arm_angle'], s['pitcher_hand']),
+            use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.plotly_chart(make_usage_chart(s['usage_lhh'], s['usage_rhh'], s['header_table']),
-                        use_container_width=True)
+        st.plotly_chart(
+            make_usage_chart(s['usage_lhh'], s['usage_rhh'], s['header_table']),
+            use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="card"><div class="card-hdr"><span class="dot"></span>Performance Metrics</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><div class="card-hdr"><span class="dot"></span>Performance Metrics</div>',
+                unsafe_allow_html=True)
     st.markdown(render_metrics_table(s['metrics_table']), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(f'''
     <div style="text-align:center;margin-top:2rem;padding:1rem;font-family:'JetBrains Mono';font-size:.65rem;color:#484f58">
-        tjStuff+ · Physics Formula {model_trainer.PHYSICS_VERSION} · μ=100 σ=10 ·
+        Stuff+ · Physics Formula {model_trainer.PHYSICS_VERSION} · μ=100 σ=10 ·
         Arm-angle adjusted · Rank normalized · Data: Baseball Savant
     </div>''', unsafe_allow_html=True)
 
@@ -255,7 +345,6 @@ def render_landing():
 # ── Process + Score ───────────────────────────────────────────────────────────
 
 def process_and_score(df, pitcher_id=None):
-    """Run the full physics Stuff+ pipeline and build card summary."""
     scored = score_pitches(df)
     label = f"Physics {model_trainer.PHYSICS_VERSION}"
     summary = build_pitcher_summary(scored, pitcher_id)
@@ -269,7 +358,7 @@ def process_and_score(df, pitcher_id=None):
 with st.sidebar:
     st.markdown('''
     <div style="font-family:'DM Sans';font-weight:900;font-size:1.2rem;color:#e6edf3;margin-bottom:.2rem">⚾ Pitcher Card</div>
-    <div style="font-family:'JetBrains Mono';font-size:.68rem;color:#58a6ff;margin-bottom:1.25rem">tjStuff+ Physics Engine</div>
+    <div style="font-family:'JetBrains Mono';font-size:.68rem;color:#58a6ff;margin-bottom:1.25rem">Stuff+ Physics Engine</div>
     ''', unsafe_allow_html=True)
     st.markdown("---")
     data_mode = st.radio("Data Source", ["Live (Savant API)", "Upload CSV"], index=0)
@@ -289,12 +378,70 @@ with st.sidebar:
 
     if data_mode == "Live (Savant API)":
         st.markdown("---")
-        st.markdown('<div style="font-family:DM Sans;font-weight:700;font-size:.8rem;color:#e6edf3;margin-bottom:.4rem">Retrain Model (optional)</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-family:DM Sans;font-weight:700;font-size:.8rem;color:#e6edf3;margin-bottom:.4rem">Retrain Model</div>',
+                    unsafe_allow_html=True)
         train_year = st.selectbox("Training Season", [2025, 2024, 2023], index=0)
-        train_btn = st.button("Retrain on Full Season", use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            train_btn = st.button("Start / Resume", use_container_width=True, type="primary")
+        with col_b:
+            reset_btn = st.button("Reset", use_container_width=True)
+
+        # Show download progress if a retrain is in progress
+        if "train_schedule" in st.session_state:
+            sched    = st.session_state.train_schedule
+            n_done   = sum(1 for c in sched if c["done"])
+            n_total  = len(sched)
+            st.progress(n_done / n_total, text=f"{n_done}/{n_total} chunks downloaded")
+            if n_done == n_total and not st.session_state.get("train_fit_done"):
+                st.info("All chunks downloaded — fitting model…")
+            elif n_done == n_total and st.session_state.get("train_fit_done"):
+                st.success("Model trained ✅")
+
         st.markdown("---")
-        st.markdown('<div style="font-family:DM Sans;font-weight:700;font-size:.8rem;color:#e6edf3;margin-bottom:.4rem">Pitcher Lookup</div>', unsafe_allow_html=True)
-        pitcher_input = st.text_input("Pitcher Name", placeholder="e.g. Skenes, Paul")
+        st.markdown('<div style="font-family:DM Sans;font-weight:700;font-size:.8rem;color:#e6edf3;margin-bottom:.4rem">Pitcher Lookup</div>',
+                    unsafe_allow_html=True)
+
+        # ── Search with dropdown autocomplete ─────────────────────────────
+        search_query = st.text_input(
+            "Search Pitcher",
+            placeholder="Start typing a name…",
+            key="pitcher_search_input"
+        )
+
+        pitcher_input = ""
+        selected_pitcher_id = None
+
+        if search_query and len(search_query) >= 2:
+            with st.spinner("Searching…"):
+                search_results = search_pitcher(search_query)
+
+            if len(search_results) > 0:
+                # Build display options
+                name_col = 'name' if 'name' in search_results.columns else \
+                           ('player_name' if 'player_name' in search_results.columns else None)
+                id_col   = 'id' if 'id' in search_results.columns else \
+                           ('player_id' if 'player_id' in search_results.columns else None)
+
+                if name_col and id_col:
+                    options = search_results[[name_col, id_col]].dropna().head(10)
+                    option_labels = options[name_col].tolist()
+
+                    chosen_name = st.selectbox(
+                        "Select Pitcher",
+                        options=option_labels,
+                        key="pitcher_dropdown"
+                    )
+                    if chosen_name:
+                        row = options[options[name_col] == chosen_name].iloc[0]
+                        pitcher_input    = chosen_name
+                        selected_pitcher_id = int(row[id_col])
+                else:
+                    st.warning("Unexpected search result format.")
+            else:
+                st.info("No results found. Try Last, First format.")
+
         lookup_year = st.selectbox("Season", [2026, 2025, 2024], index=0)
         if lookup_year >= datetime.now().year:
             days_back = st.slider("Days Back", 7, 180, 45)
@@ -309,67 +456,140 @@ with st.sidebar:
 
 if data_mode == "Live (Savant API)":
 
-    # Optional retrain
+    # ── Reset button ─────────────────────────────────────────────────────────
+    if reset_btn:
+        if "train_schedule" in st.session_state:
+            clear_chunk_cache(st.session_state.get("train_year_active", train_year))
+        for key in ["train_schedule", "train_year_active", "train_fit_done",
+                    "train_result"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    # ── Start / Resume retrain ────────────────────────────────────────────────
     if train_btn:
-        st.info(f"Downloading {train_year} season... This takes 5-15 min on first run.")
-        pbar = st.progress(0.0)
-        status = st.empty()
-        def _dl_progress(pct, msg):
-            pbar.progress(min(pct, 1.0))
-            status.text(msg)
-        try:
-            sdata = fetch_season(train_year, progress_callback=_dl_progress)
-            if len(sdata) == 0:
-                st.error("No data returned.")
+        # If starting fresh or switching year, rebuild schedule
+        if ("train_schedule" not in st.session_state
+                or st.session_state.get("train_year_active") != train_year):
+            st.session_state["train_schedule"]    = season_chunk_schedule(train_year)
+            st.session_state["train_year_active"] = train_year
+            st.session_state.pop("train_fit_done", None)
+            st.session_state.pop("train_result",   None)
+        st.session_state["train_running"] = True
+        st.rerun()
+
+    # ── Streaming download + train loop ──────────────────────────────────────
+    if st.session_state.get("train_running") and \
+            not st.session_state.get("train_fit_done"):
+
+        sched = st.session_state.get("train_schedule", [])
+        if not sched:
+            st.error("No schedule — click Start first.")
+            st.session_state.pop("train_running", None)
+        else:
+            # Find the next chunk that hasn't been downloaded yet
+            pending = [c for c in sched if not c["done"]]
+
+            if pending:
+                item   = pending[0]
+                pbar   = st.progress(0.0)
+                status = st.empty()
+                n_done = sum(1 for c in sched if c["done"])
+                n_tot  = len(sched)
+
+                status.text(
+                    f"Downloading {item['start'].strftime('%b %d')} – "
+                    f"{item['end'].strftime('%b %d, %Y')} "
+                    f"({n_done+1}/{n_tot})…")
+                pbar.progress((n_done) / n_tot)
+
+                try:
+                    import time as _time
+                    chunk_df = fetch_chunk(
+                        st.session_state["train_year_active"],
+                        item["start"], item["end"], item["cache"])
+                    item["done"] = True
+                    _time.sleep(1.2)  # be respectful to Savant
+                except Exception as e:
+                    st.error(f"Chunk download failed: {e}")
+                    st.session_state.pop("train_running", None)
+                    st.stop()
+
+                pbar.progress((n_done + 1) / n_tot)
+                status.text(f"Chunk {n_done+1}/{n_tot} done. Refreshing…")
+                st.rerun()   # come back for the next chunk
+
             else:
-                def _train_progress(msg, pct):
+                # All chunks downloaded — now fit the model
+                status = st.empty()
+                pbar   = st.progress(0.0)
+                status.text("All data downloaded. Fitting model (this takes ~2 min)…")
+
+                def _fit_progress(msg, pct):
                     status.text(msg)
-                    pbar.progress(min(0.5 + pct * 0.5, 1.0))
-                result = train_model(sdata, status_fn=_train_progress)
-                pbar.progress(1.0)
-                status.text("")
-                st.success(f"Model trained on {result['n_pitches']:,} pitches! "
-                           f"P50={result['score_p50']}, P95={result['score_p95']}, P99={result['score_p99']}")
-        except Exception as e:
-            st.error(f"Training failed: {e}")
-            import traceback; st.code(traceback.format_exc())
+                    pbar.progress(min(float(pct), 1.0))
+
+                try:
+                    loaded_chunks = []
+                    for item in sched:
+                        if item["cache"].exists():
+                            try:
+                                loaded_chunks.append(pd.read_parquet(item["cache"]))
+                            except Exception:
+                                pass
+
+                    if not loaded_chunks:
+                        st.error("No cached chunks found — try resetting and restarting.")
+                        st.session_state.pop("train_running", None)
+                        st.stop()
+
+                    result = train_model_streaming(loaded_chunks, status_fn=_fit_progress)
+                    st.session_state["train_fit_done"] = True
+                    st.session_state["train_result"]   = result
+                    st.session_state.pop("train_running", None)
+                    pbar.progress(1.0)
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Model fitting failed: {e}")
+                    import traceback; st.code(traceback.format_exc())
+                    st.session_state.pop("train_running", None)
+
+    # ── Show result after successful train ────────────────────────────────────
+    if st.session_state.get("train_fit_done") and \
+            "train_result" in st.session_state:
+        r = st.session_state["train_result"]
+        st.success(
+            f"✅ Model trained on {r['n_pitches']:,} pitches! "
+            f"P50={r['score_p50']} · P95={r['score_p95']} · P99={r['score_p99']}")
 
     # Pitcher lookup
-    if load_btn and pitcher_input:
+    if load_btn and pitcher_input and selected_pitcher_id:
         if not model_is_trained():
             st.error("No model loaded. Place pickle files in data/model/ or retrain.")
         else:
-            with st.spinner(f"Searching for '{pitcher_input}'..."):
-                results = search_pitcher(pitcher_input)
-            if len(results) == 0:
-                st.error(f"No players found for '{pitcher_input}'. Try Last, First format.")
+            pid = selected_pitcher_id
+            with st.spinner(f"Fetching {lookup_year} data for {pitcher_input} (ID: {pid})…"):
+                if days_back:
+                    pdf = fetch_pitcher_live(pid, days_back=days_back)
+                else:
+                    pdf = fetch_pitcher_season(pid, lookup_year)
+
+            if len(pdf) == 0:
+                st.error("No data returned. Season may not have started yet.")
             else:
-                if len(results) > 1 and 'name' in results.columns:
-                    opts = results['name'].tolist()[:10]
-                    chosen = st.selectbox("Multiple matches:", opts)
-                    prow = results[results['name']==chosen].iloc[0]
-                else:
-                    prow = results.iloc[0]
-                pid = int(prow.get('id', prow.get('player_id', 0)))
-                if pid == 0:
-                    st.error("Could not determine player ID.")
-                else:
-                    with st.spinner(f"Fetching {lookup_year} data (ID: {pid})..."):
-                        if days_back:
-                            pdf = fetch_pitcher_live(pid, days_back=days_back)
-                        else:
-                            pdf = fetch_pitcher_season(pid, lookup_year)
-                    if len(pdf) == 0:
-                        st.error("No data returned. Season may not have started yet.")
-                    else:
-                        st.success(f"{len(pdf):,} pitches loaded")
-                        try:
-                            summary, label = process_and_score(pdf, pid)
-                            render_card(summary, label)
-                        except Exception as e:
-                            st.error(f"Processing error: {e}")
-                            import traceback; st.code(traceback.format_exc())
-    elif not load_btn:
+                st.success(f"{len(pdf):,} pitches loaded")
+                try:
+                    summary, label = process_and_score(pdf, pid)
+                    render_card(summary, label)
+                except Exception as e:
+                    st.error(f"Processing error: {e}")
+                    import traceback; st.code(traceback.format_exc())
+
+    elif load_btn and not pitcher_input:
+        st.warning("Please search for and select a pitcher first.")
+
+    elif not load_btn and not st.session_state.get("train_running") \
+            and not st.session_state.get("train_fit_done"):
         render_landing()
 
 elif data_mode == "Upload CSV":
@@ -382,8 +602,11 @@ elif data_mode == "Upload CSV":
             try:
                 scored = score_from_csv(raw)
                 if 'pitcher' in scored.columns and 'player_name' in scored.columns:
-                    pitchers = scored.groupby(['pitcher','player_name']).size().reset_index(name='n').sort_values('n', ascending=False)
-                    opts = {f"{r['player_name']} ({r['n']}p)": r['pitcher'] for _, r in pitchers.head(50).iterrows()}
+                    pitchers = (scored.groupby(['pitcher', 'player_name'])
+                                .size().reset_index(name='n')
+                                .sort_values('n', ascending=False))
+                    opts = {f"{r['player_name']} ({r['n']}p)": r['pitcher']
+                            for _, r in pitchers.head(50).iterrows()}
                     sel = st.selectbox("Select Pitcher", list(opts.keys()))
                     pid = opts[sel]
                 else:
