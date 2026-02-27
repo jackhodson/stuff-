@@ -1,5 +1,5 @@
 """
-model_trainer.py  v15 — Physics-Formula Stuff+
+model_trainer.py  v18 — Physics-Formula Stuff+
 ────────────────────────────────────────────────
 Direct physics-formula scorer with domain-knowledge weights, calibrated from
 actual training data (league means/stds per pitch type).
@@ -11,6 +11,17 @@ Gyro sliders get a separate scoring path (velocity + vertical split + VAA diff
 
 Rank normalization → proper 100-mean distribution.
 Hard velocity floor for slow fastballs.
+
+FIXES (v18):
+  - VAA now computed via correct Statcast kinematic formula:
+      vy_f = -sqrt(vy0² - 2*ay*(y0 - yf))   where y0=50, yf=17/12
+      t    = (vy_f - vy0) / ay
+      vz_f = vz0 + az*t
+      VAA  = -arctan(vz_f / vy_f) * (180/pi)
+  - HB sign convention: POSITIVE = arm side for BOTH handedness.
+      RHP pfx_x is positive arm-side already.
+      LHP pfx_x is negative arm-side in Statcast → flip sign so positive = arm side.
+  - Arm angle on movement plot now correctly derived from release position.
 """
 
 import pickle
@@ -34,15 +45,10 @@ OFFSPEED_TYPES = {"CH", "FS", "FO"}
 GYRO_SL_TYPES  = {"SL", "ST", "SW"}
 
 # ─── DIMENSION WEIGHTS ────────────────────────────────────────────────────────
-# velocity, ivb (arm-slot adjusted), hb (arm-slot adjusted),
-# vaa (arm-slot adjusted), extension, spin_rate
 WEIGHTS = {
     "FF": {"velo":2.5, "ivb":1.8, "hb":0.6, "vaa":1.5, "ext":0.8, "spin":0.8},
-    # SI: arm-side run (hb_run) + depth (si_depth) scored aggressively
-    # 20"+ HB = elite, 0" iVB = elite, both = unicorn
     "SI": {"velo":2.0, "si_depth":2.0, "hb_run":2.5, "vaa":0.5, "ext":0.5, "spin":0.4},
     "FC": {"velo":2.2, "ivb":1.2, "hb":0.8, "vaa":0.8, "ext":0.5, "spin":0.6},
-    # No standalone velo — fast CH/FS is only good through velo_gap (deception from FB)
     "CH": {"tunnel":3.0, "velo_gap":1.5, "hb_tunnel":2.0},
     "FS": {"tunnel":2.5, "velo_gap":2.0, "hb_tunnel":1.5},
     "FO": {"tunnel":2.5, "velo_gap":1.5, "hb_tunnel":1.5},
@@ -54,14 +60,13 @@ WEIGHTS = {
     "SV": {"velo":1.8, "ivb":1.5, "hb":2.0, "vaa":0.5, "spin":0.8},
 }
 
-# Gyro slider weights: velocity + vertical split + VAA diff + low spin efficiency
 GYRO_WEIGHTS = {
     "velo":    2.0,
-    "vsplit":  3.0,   # iVB gap from own FB (Cease: 15.2" = elite)
-    "vaadiff": 1.5,   # VAA plane difference from own FB
-    "spineff": 2.0,   # inverted — lower efficiency = more gyro bite
+    "vsplit":  3.0,
+    "vaadiff": 1.5,
+    "spineff": 2.0,
 }
-GYRO_IVB_THRESHOLD = 4.0   # inches of iVB deviation from slot expectation
+GYRO_IVB_THRESHOLD = 4.0
 GYRO_HB_THRESHOLD  = 5.0
 GYRO_VSPLIT_MEAN   = 10.0
 GYRO_VSPLIT_STD    = 3.0
@@ -70,46 +75,77 @@ GYRO_VAADIFF_STD   = 1.0
 GYRO_SPINEFF_MEAN  = 0.35
 GYRO_SPINEFF_STD   = 0.08
 
-# High-iVB sweeper: ST/SW with substantial BOTH iVB and HB
-# "12-12 is better than 7-14" — combined Magnus force in both planes
-# Threshold: sweeper with arm-slot-adjusted iVB deviation > 5" above expected
-HIGH_IVB_SW_IVB_THRESHOLD = 5.0   # inches ABOVE slot-expected iVB (more rise than typical sweeper)
-HIGH_IVB_SW_HB_MIN        = 8.0   # still needs meaningful sweep (inches from slot)
-HIGH_IVB_SW_COMBINED_MEAN = 18.0  # avg combined |iVB|+|HB| for high-iVB sweepers (~9+9)
+HIGH_IVB_SW_IVB_THRESHOLD = 5.0
+HIGH_IVB_SW_HB_MIN        = 8.0
+HIGH_IVB_SW_COMBINED_MEAN = 18.0
 HIGH_IVB_SW_COMBINED_STD  = 3.0
-# Weights: reward both dims roughly equally, bonus for balance (12-12 > 7-14)
 HIGH_IVB_SW_WEIGHTS = {
     "velo":     1.5,
-    "combined": 3.0,   # total |iVB| + |HB| — more is better
-    "balance":  2.5,   # penalty when one dim dominates (|iVB - HB| is large)
+    "combined": 3.0,
+    "balance":  2.5,
 }
 
-# Offspeed tunnel baselines — avg CH/FS depth gap, velo gap, HB gap from own FB
-# Centered so an average changeup scores raw≈0 → Stuff+ ≈ 100
-OFFSPEED_DEPTH_GAP_MEAN = 9.0   # avg (fb_ivb - ch_ivb) in inches
+OFFSPEED_DEPTH_GAP_MEAN = 9.0
 OFFSPEED_DEPTH_GAP_STD  = 2.5
-OFFSPEED_VELO_GAP_MEAN  = 9.0   # avg (fb_velo - ch_velo) in mph
+OFFSPEED_VELO_GAP_MEAN  = 9.0
 OFFSPEED_VELO_GAP_STD   = 2.5
-OFFSPEED_HB_GAP_MEAN    = 2.0   # avg arm-side HB separation (ch_hb - fb_hb) inches
+OFFSPEED_HB_GAP_MEAN    = 2.0
 OFFSPEED_HB_GAP_STD     = 3.5
 
 FB_VELO_BASELINE = 93.0
 FB_VELO_RATE     = 2.5
 
 
-# ─── STATCAST VAA / HAA ───────────────────────────────────────────────────────
+# ─── STATCAST VAA / HAA  (correct kinematic formula per Statcast docs) ────────
+#
+#   vy_f = -sqrt(vy0² - 2 * ay * (y0 - yf))
+#   t    = (vy_f - vy0) / ay
+#   vz_f = vz0 + az * t
+#   vx_f = vx0 + ax * t
+#   VAA  = -arctan(vz_f / vy_f) * (180 / pi)
+#   HAA  = -arctan(vx_f / vy_f) * (180 / pi)
+#
+# y0 = 50 ft (Statcast measurement plane), yf = 17/12 ft (front of home plate)
 
 def compute_vaa_haa(df: pd.DataFrame):
     try:
-        t    = (17.0/12.0) / np.abs(df["vy0"].values)
-        vy_f = df["vy0"].values + df["ay"].values * t
-        vz_f = df["vz0"].values + df["az"].values * t
-        vx_f = df["vx0"].values + df["ax"].values * t
-        vaa  = -np.arctan(vz_f / vy_f) * (180.0 / np.pi)
-        haa  = -np.arctan(vx_f / vy_f) * (180.0 / np.pi)
+        vy0 = df["vy0"].values.astype(float)
+        vz0 = df["vz0"].values.astype(float)
+        vx0 = df["vx0"].values.astype(float)
+        ay  = df["ay"].values.astype(float)
+        az  = df["az"].values.astype(float)
+        ax  = df["ax"].values.astype(float)
+
+        y0 = 50.0          # feet — Statcast reference plane
+        yf = 17.0 / 12.0   # feet — front of home plate
+
+        # Final y-velocity at home plate (kinematic, always negative — toward plate)
+        inner = vy0**2 - 2.0 * ay * (y0 - yf)
+        # Guard against floating-point negatives under sqrt
+        inner = np.clip(inner, 0.0, None)
+        vy_f  = -np.sqrt(inner)
+
+        # Time of flight from y=50 to home plate
+        # Avoid divide-by-zero where ay ≈ 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            t = np.where(np.abs(ay) > 1e-6,
+                         (vy_f - vy0) / ay,
+                         (y0 - yf) / np.abs(vy0))
+
+        vz_f = vz0 + az * t
+        vx_f = vx0 + ax * t
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vaa = -np.arctan(vz_f / vy_f) * (180.0 / np.pi)
+            haa = -np.arctan(vx_f / vy_f) * (180.0 / np.pi)
+
+        vaa = np.where(np.isfinite(vaa), vaa, np.nan)
+        haa = np.where(np.isfinite(haa), haa, np.nan)
+
     except Exception:
         vaa = np.full(len(df), np.nan)
         haa = np.full(len(df), np.nan)
+
     return vaa, haa
 
 
@@ -127,10 +163,70 @@ def apply_vaa_adjustment(df, coeffs):
     return df
 
 
+# ─── HB SIGN CONVENTION ───────────────────────────────────────────────────────
+# Statcast pfx_x convention:
+#   RHP: positive = catcher's right = pitcher's arm side  ✓ (no flip needed)
+#   LHP: positive = catcher's right = pitcher's GLOVE side (needs flip)
+#
+# We want: positive HB = arm side (toward the pitcher's throwing-arm side)
+# so that the same physical movement (e.g. cut) always has the same sign
+# regardless of handedness.
+#
+# After this transform:
+#   RHP sinker/4-seam: hb > 0 (arm side, i.e. right)
+#   LHP sinker/4-seam: hb > 0 (arm side, i.e. left)
+#   Both: curveball hb < 0 (glove side)
+
+def fix_hb_handedness(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flip HB sign for LHP so that positive = arm side for both handedness.
+    Operates on the 'hb' column (already converted to inches from pfx_x).
+    """
+    df = df.copy()
+    if "p_throws" in df.columns and "hb" in df.columns:
+        lhp_mask = df["p_throws"] == "L"
+        df.loc[lhp_mask, "hb"] = -df.loc[lhp_mask, "hb"]
+    return df
+
+
+# ─── ARM ANGLE (correct release-point geometry) ───────────────────────────────
+# Arm angle = degrees above horizontal from a ~5.0 ft baseline reference,
+# matching the scale Statcast publishes on Baseball Savant:
+#   ~0-10°  = sidearm
+#   ~20-30° = low 3/4
+#   ~35-45° = 3/4 / high 3/4
+#   ~55-70° = over the top
+#
+# Formula: arctan2(release_pos_z - 5.0, abs(release_pos_x))
+#
+# release_pos_x in Statcast is from the CATCHER's perspective:
+#   RHP: negative (catcher's left = pitcher's arm side)
+#   LHP: positive (catcher's right = pitcher's arm side)
+# We take abs(rx) so both handedness use the same geometric formula —
+# NO handedness flip is needed here (abs covers it).
+# The HB flip (fix_hb_handedness) is separate and only for movement direction.
+
+def compute_arm_angle(df: pd.DataFrame) -> np.ndarray:
+    """
+    Return arm angle in degrees (0=sidearm, ~60=over-top).
+    Matches the scale of Statcast's published arm angle metric.
+    No handedness flip required — abs(release_pos_x) handles both RHP and LHP.
+    """
+    rx = df["release_pos_x"].values.astype(float)
+    rz = df["release_pos_z"].values.astype(float)
+
+    # abs(rx) = horizontal distance from center, regardless of handedness
+    # 5.0 ft baseline: the approximate height at which arm angle = 0° (horizontal)
+    arm_angle = np.degrees(np.arctan2(rz - 5.0, np.abs(rx)))
+
+    # Clip to valid range
+    arm_angle = np.clip(arm_angle, 0.0, 90.0)
+    return arm_angle
+
+
 # ─── LEAGUE STATS ─────────────────────────────────────────────────────────────
 
 def fit_league_stats(df: pd.DataFrame) -> dict:
-    """Per-pitch-type means/stds for velo, iVB, HB, adj_vaa, extension, spin."""
     stats = {}
     for pt, grp in df.groupby("pitch_type"):
         if len(grp) < 100:
@@ -153,12 +249,10 @@ def fit_league_stats(df: pd.DataFrame) -> dict:
 # ─── FASTBALL REFERENCE PER PITCHER ──────────────────────────────────────────
 
 def compute_fb_reference(df: pd.DataFrame) -> pd.DataFrame:
-    """Add fb_ivb, fb_hb, fb_velo, fb_vaa columns — each pitcher's avg 4S/SI."""
     df = df.copy()
     pitcher_col = next((c for c in ["pitcher","pitcher_id","player_id"]
                         if c in df.columns), None)
 
-    # Pre-initialize so columns always exist
     for c in ["fb_ivb","fb_hb","fb_velo","fb_vaa"]:
         df[c] = np.nan
 
@@ -174,7 +268,6 @@ def compute_fb_reference(df: pd.DataFrame) -> pd.DataFrame:
                .rename(columns={"ivb":"fb_ivb","hb":"fb_hb",
                                  "release_speed":"fb_velo","adj_vaa":"fb_vaa"}))
 
-    # Assign via index lookup — avoids merge column collision entirely
     pid = df[pitcher_col].values
     for col in ["fb_ivb","fb_hb","fb_velo","fb_vaa"]:
         lut = ref[col].to_dict()
@@ -186,22 +279,39 @@ def compute_fb_reference(df: pd.DataFrame) -> pd.DataFrame:
 # ─── ARM-ANGLE SHAPE MODELS ───────────────────────────────────────────────────
 
 def fit_arm_angle_models(df: pd.DataFrame) -> dict:
-    """Per pitch type linear regressions: expected_ivb/hb/vaa = f(arm_angle)."""
+    """
+    Fit per-pitch-type linear regressions: expected_dim = a*arm_angle + b.
+
+    Dimensions fitted:
+      ivb     — raw induced vertical break (inches)
+      hb      — horizontal break, arm-side positive (inches)
+      adj_vaa — plate-z-adjusted vertical approach angle (degrees)
+      _haa_abs — abs(HAA) — horizontal approach angle magnitude (degrees)
+                 Lower arm slots naturally generate higher abs(HAA) for breaking
+                 balls; scoring HAA deviations relative to slot expectation
+                 prevents sidearm pitchers from getting an unfair HAA bonus.
+    """
     models = {}
     if "arm_angle" not in df.columns:
         return models
+
+    # Pre-compute abs HAA column for regression
+    df = df.copy()
+    if "_haa" in df.columns:
+        df["_haa_abs"] = df["_haa"].abs()
+
     for pt, grp in df.groupby("pitch_type"):
         if len(grp) < 200:
             continue
         aa = grp["arm_angle"].values
         m  = {}
-        for col in ["ivb","hb","adj_vaa"]:
+        for col in ["ivb", "hb", "adj_vaa", "_haa_abs"]:
             if col not in grp.columns:
                 continue
             y    = grp[col].values
             mask = np.isfinite(aa) & np.isfinite(y)
             m[col] = tuple(np.polyfit(aa[mask], y[mask], 1)) if mask.sum() > 50 \
-                     else (0.0, float(np.nanmean(y)))
+                     else (0.0, float(np.nanmean(y[mask])))
         models[pt] = m
     return models
 
@@ -237,12 +347,6 @@ def _exp(z, scale=2.5):
 def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
                       arm_models: dict = None,
                       haa_stats:  dict = None) -> np.ndarray:
-    """
-    Score every pitch using the direct physics formula.
-    Every movement dimension (iVB, HB, VAA) is arm-angle adjusted.
-    Spin rate contributes to every pitch type.
-    Gyro sliders use MAX(normal_score, gyro_score).
-    """
     scores   = np.zeros(len(df))
     has_arm  = "arm_angle" in df.columns and arm_models
     has_haa  = "_haa" in df.columns and haa_stats
@@ -275,14 +379,17 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
             ivb_dev = ivb_vals - lg["ivb"][0]
         ivb_z = ivb_dev / lg["ivb"][1]
         if pt not in FB_TYPES | FC_TYPES:
-            ivb_z = -ivb_z          # depth (more negative) is better
+            ivb_z = -ivb_z
         s += w.get("ivb", 0) * _exp(ivb_z)
 
         # ── HB: arm-angle adjusted ───────────────────────────────────────────
+        # hb is now arm-side-positive for both handedness.
+        # For FB/FC: more arm-side run (positive) is better.
+        # For offspeed/breaking: scored on total deviation from slot.
         if has_arm and "hb" in am and aa is not None:
-            hb_dev = np.abs(hb_vals) - np.abs(_slot_expected(aa, am["hb"]))
+            hb_dev = hb_vals - _slot_expected(aa, am["hb"])
         else:
-            hb_dev = np.abs(hb_vals) - np.abs(lg["hb"][0])
+            hb_dev = hb_vals - lg["hb"][0]
         hb_z = hb_dev / lg["hb"][1]
         s += w.get("hb", 0) * _exp(hb_z)
 
@@ -294,7 +401,7 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
             vaa_dev = vaa_vals - lg["vaa"][0]
         vaa_z = vaa_dev / lg["vaa"][1]
         if pt not in FB_TYPES | FC_TYPES:
-            vaa_z = -vaa_z          # steeper (more negative) is better
+            vaa_z = -vaa_z
         s += w.get("vaa", 0) * _exp(vaa_z)
 
         # ── Extension ───────────────────────────────────────────────────────
@@ -312,94 +419,90 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
             )
             s += w["spin"] * _exp(spin_z)
 
-        # ── Sinker: arm-side run (hb_run) + depth (si_depth) ──────────────────
-        # "20 HB is really impressive" — reward arm-side run aggressively.
-        # "Webb near 0 iVB = impressive" — reward depth below slot expectation.
-        # "lots of depth AND run = outlier" — multiplicative bonus for both.
-        #
-        # hb_run: uses tighter std (2.5") so elite HB (20"+) scores very high.
-        #   Centered at league avg HB (~13"). 20"=z+2.8, 16"=z+1.2, 10"=z-1.2
-        # si_depth: how much MORE the sinker drops vs slot expectation.
-        #   Webb (0" iVB, slot expects 8") → depth_dev=+8" → z=+2.2 → elite
+        # ── Sinker: arm-side run + depth ───────────────────────────────────
         if "hb_run" in w:
-            hb_abs   = np.abs(hb_vals)
-            SI_HB_MEAN = 13.0   # league avg arm-side run for sinkers
-            SI_HB_STD  = 2.5    # tighter than raw std — makes elite HB stand out
-            hb_run_z = (hb_abs - SI_HB_MEAN) / SI_HB_STD
+            SI_HB_MEAN = 13.0
+            SI_HB_STD  = 2.5
+            # hb_vals already arm-side-positive; sinker arm-side run = positive hb
+            hb_run_z = (hb_vals - SI_HB_MEAN) / SI_HB_STD
             s += w["hb_run"] * _exp(hb_run_z)
 
         if "si_depth" in w:
             if has_arm and "ivb" in am and aa is not None:
                 expected_ivb = _slot_expected(aa, am["ivb"])
-                depth_dev    = expected_ivb - ivb_vals  # positive = more sink than slot
+                depth_dev    = expected_ivb - ivb_vals
             else:
                 depth_dev    = lg["ivb"][0] - ivb_vals
-            SI_DEPTH_STD = 2.5   # tighter than raw std — makes elite sink stand out
+            SI_DEPTH_STD = 2.5
             depth_z = depth_dev / SI_DEPTH_STD
             s += w["si_depth"] * _exp(depth_z)
 
-            # Outlier bonus: BOTH elite HB run AND elite depth simultaneously
-            # e.g. Webb (-2" iVB, 18" HB) should grade significantly higher than
-            # Webb (0" iVB, 13" HB) or average (8" iVB, 20" HB)
             if "hb_run" in w:
-                hb_abs       = np.abs(hb_vals)
-                both_elite   = (depth_z > 0.5) & (hb_abs > 16.0)
-                outlier_z    = np.minimum(depth_z, (hb_abs - 16.0) / 2.0)
+                both_elite   = (depth_z > 0.5) & (hb_vals > 16.0)
+                outlier_z    = np.minimum(depth_z, (hb_vals - 16.0) / 2.0)
                 s += both_elite.astype(float) * 1.0 * np.clip(_exp(outlier_z), 0, 3)
 
-        # ── HAA: horizontal approach angle (sweepers/sliders) ───────────────
+        # ── HAA ─────────────────────────────────────────────────────────────
+        # HAA is computed via the correct Statcast kinematic formula (same t as VAA).
+        # Typical values (abs): SL ~3-4°, ST/SW ~4-6°, elite sweeper ~6-9°.
+        #
+        # ARM-ANGLE ADJUSTED: sidearm pitchers naturally generate larger abs(HAA)
+        # because of their release geometry, not because of superior horizontal
+        # approach quality. We compare abs(HAA) to the slot-expected abs(HAA)
+        # for that pitch type using the same linear model pattern as iVB/HB/VAA.
+        #
+        # haa_dev = abs(_haa) - slot_expected_abs_haa(arm_angle)
+        # Positive dev = more horizontal approach than arm slot predicts = good.
         if "haa" in w and has_haa and pt in haa_stats:
             hs      = haa_stats[pt]
             haa_abs = np.abs(rows["_haa"].values)
-            haa_z   = (haa_abs - abs(hs["mean"])) / hs["std"]
+            # Use arm-angle adjusted baseline if model available
+            if has_arm and "_haa_abs" in am and aa is not None:
+                expected_haa = _slot_expected(aa, am["_haa_abs"])
+                haa_dev      = haa_abs - expected_haa
+                haa_z        = haa_dev / max(hs["std"], 0.01)
+            else:
+                # Fallback: compare to league-average HAA for pitch type
+                haa_z = (haa_abs - abs(hs["mean"])) / hs["std"]
             s += w["haa"] * _exp(haa_z)
 
-        # ── CH/FS/FO: graded on deception vs own fastball, not raw movement ────
-        # Three dimensions: (1) depth tunnel, (2) velocity deception, (3) arm-side fade
-        # All centered at league averages → avg offspeed = raw 0 → Stuff+ ≈ 100
+        # ── CH/FS/FO: graded on deception vs own fastball ──────────────────
         if any(k in w for k in ("tunnel", "velo_gap", "hb_tunnel")):
             fb_ivb_ref  = rows["fb_ivb"].values
             fb_velo_ref = rows["fb_velo"].values
             fb_hb_ref   = rows["fb_hb"].values
             os_velo     = rows["release_speed"].values
 
-            # (1) Depth tunnel: how much more drop than avg offspeed off its FB
-            # League avg gap ≈ 9", std ≈ 2.5" → depth_z=0 at average
             depth_gap  = np.where(np.isfinite(fb_ivb_ref),
                                   fb_ivb_ref - ivb_vals,
                                   OFFSPEED_DEPTH_GAP_MEAN)
             depth_z_os = (depth_gap - OFFSPEED_DEPTH_GAP_MEAN) / OFFSPEED_DEPTH_GAP_STD
             s += w.get("tunnel", 0) * np.clip(_exp(depth_z_os), -3, 3)
 
-            # (2) Velocity gap: bigger gap = more deception (tunnels longer off FB)
-            # League avg gap ≈ 9 mph, std ≈ 2.5 mph → penalizes too-fast OR too-slow
             velo_gap_mph = np.where(np.isfinite(fb_velo_ref),
                                     fb_velo_ref - os_velo,
                                     OFFSPEED_VELO_GAP_MEAN)
             velo_gap_z   = (velo_gap_mph - OFFSPEED_VELO_GAP_MEAN) / OFFSPEED_VELO_GAP_STD
             s += w.get("velo_gap", 0) * np.clip(_exp(velo_gap_z), -3, 3)
 
-            # (3) Arm-side fade: separation from own FB's horizontal break
-            # Avg CH fades ~2" more arm-side than FB, std ≈ 3.5"
+            # HB tunnel: arm-side separation from own FB
+            # Both hb_vals and fb_hb_ref are now arm-side-positive
             hb_gap_raw = np.where(np.isfinite(fb_hb_ref),
-                                  np.abs(hb_vals) - np.abs(fb_hb_ref),
+                                  hb_vals - fb_hb_ref,
                                   0.0)
             hb_gap_z   = (hb_gap_raw - OFFSPEED_HB_GAP_MEAN) / OFFSPEED_HB_GAP_STD
             s += w.get("hb_tunnel", 0) * np.clip(_exp(hb_gap_z), -3, 3)
 
-        # ── High-iVB sweeper: both HB sweep + iVB rise rewarded ─────────────
-        # "12-12 is better than 7-14" — multiple Magnus forces both active.
-        # Detection: ST/SW with arm-slot-adjusted iVB ABOVE expected (more rise than typical).
-        # Graded on: velocity + combined |iVB|+|HB| + balance bonus (neither dim dominates).
+        # ── High-iVB sweeper ────────────────────────────────────────────────
         if pt in {"ST", "SW"}:
             if has_arm and "ivb" in am and aa is not None:
                 expected_ivb_sw = _slot_expected(aa, am["ivb"])
-                # Typical ST/SW: negative iVB (drops). High-iVB SW: less negative or positive.
-                ivb_above_expected = ivb_vals - expected_ivb_sw  # + = more rise than slot predicts
+                ivb_above_expected = ivb_vals - expected_ivb_sw
                 hi_ivb_mask = ivb_above_expected > HIGH_IVB_SW_IVB_THRESHOLD
-                hb_enough   = np.abs(hb_vals - _slot_expected(aa, am.get("hb", {}) or (0, 1))) > HIGH_IVB_SW_HB_MIN                               if "hb" in am else np.abs(hb_vals) > HIGH_IVB_SW_HB_MIN
+                hb_enough   = (np.abs(hb_vals - _slot_expected(aa, am.get("hb", (0,1)))) > HIGH_IVB_SW_HB_MIN
+                               if "hb" in am else np.abs(hb_vals) > HIGH_IVB_SW_HB_MIN)
             else:
-                hi_ivb_mask = ivb_vals > 3.0   # fallback: positive iVB sweepers
+                hi_ivb_mask = ivb_vals > 3.0
                 hb_enough   = np.abs(hb_vals) > HIGH_IVB_SW_HB_MIN
 
             hi_sw_mask = hi_ivb_mask & hb_enough
@@ -407,28 +510,20 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
                 hi_idx = np.where(hi_sw_mask)[0]
                 hr     = rows.iloc[hi_idx]
 
-                # Velocity
                 hi_velo_z = (hr["release_speed"].values - lg["velo"][0]) / lg["velo"][1]
                 hi_s      = HIGH_IVB_SW_WEIGHTS["velo"] * _exp(hi_velo_z)
 
-                # Combined movement: |iVB| + |HB| — more of both is better
                 combined  = np.abs(hr["ivb"].values) + np.abs(hr["hb"].values)
                 comb_z    = (combined - HIGH_IVB_SW_COMBINED_MEAN) / HIGH_IVB_SW_COMBINED_STD
                 hi_s     += HIGH_IVB_SW_WEIGHTS["combined"] * np.clip(_exp(comb_z), -3, 3)
 
-                # Balance bonus: 12-12 > 7-14 — penalize when one dim dominates
                 imbalance   = np.abs(np.abs(hr["ivb"].values) - np.abs(hr["hb"].values))
-                balance_z   = -(imbalance - 3.0) / 3.0  # league avg imbalance ~3", invert
+                balance_z   = -(imbalance - 3.0) / 3.0
                 hi_s       += HIGH_IVB_SW_WEIGHTS["balance"] * np.clip(_exp(balance_z), -3, 3)
 
-                # Take MAX(normal_score, high_ivb_score)
                 s[hi_idx] = np.maximum(s[hi_idx], hi_s)
 
-        # ── Gyro slider: MAX(normal, gyro) approach ──────────────────────────
-        # A true gyro (near-zero arm-adjusted movement) scores on different dims:
-        # velocity + iVB vertical split from FB + VAA diff from FB + low spin eff.
-        # Taking MAX means great-movement SLs keep their normal score,
-        # and true gyros (Cease) get properly rewarded.
+        # ── Gyro slider ─────────────────────────────────────────────────────
         if pt in GYRO_SL_TYPES:
             if has_arm and "ivb" in am and "hb" in am and aa is not None:
                 gyro_mask = (
@@ -473,12 +568,8 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
 
 
 # ─── HIGH-iVB SWEEPER TAGGING ─────────────────────────────────────────────────
-# Tag high-iVB sweepers (ST/SW with much more rise than slot predicts) as "STH"
-# so they get their own rank-norm bucket. avg(STH) = 100, avg(normal ST) = 100.
-# Combined movement (iVB + HB both substantial) defines this subtype.
 
 def tag_high_ivb_sweepers(df: pd.DataFrame, arm_models: dict = None) -> pd.DataFrame:
-    """Add 'STH' tag to high-iVB sweepers for per-type rank normalization."""
     df = df.copy()
     sw_mask = df["pitch_type"].isin({"ST", "SW"})
     if not sw_mask.any() or "ivb" not in df.columns:
@@ -487,16 +578,16 @@ def tag_high_ivb_sweepers(df: pd.DataFrame, arm_models: dict = None) -> pd.DataF
     ivb = df.loc[sw_mask, "ivb"].values
     hb  = df.loc[sw_mask, "hb"].values
 
-    if arm_models and "ST" in arm_models and "ivb" in arm_models["ST"]             and "arm_angle" in df.columns:
+    if arm_models and "ST" in arm_models and "ivb" in arm_models["ST"] \
+            and "arm_angle" in df.columns:
         aa           = df.loc[sw_mask, "arm_angle"].values
         expected_ivb = np.polyval(arm_models["ST"]["ivb"], aa)
         ivb_above    = ivb - expected_ivb
     else:
-        ivb_above = ivb - (-4.0)   # fallback: league avg ST iVB ≈ -4"
+        ivb_above = ivb - (-4.0)
 
-    hb_abs     = np.abs(hb)
-    # High-iVB sweeper: more rise than slot predicts AND enough horizontal sweep
-    hi_ivb     = (ivb_above > HIGH_IVB_SW_IVB_THRESHOLD) & (hb_abs > HIGH_IVB_SW_HB_MIN)
+    hb_abs = np.abs(hb)
+    hi_ivb = (ivb_above > HIGH_IVB_SW_IVB_THRESHOLD) & (hb_abs > HIGH_IVB_SW_HB_MIN)
 
     sw_idx = df.index[sw_mask]
     df.loc[sw_idx[hi_ivb], "pitch_type"] = "STH"
@@ -504,20 +595,15 @@ def tag_high_ivb_sweepers(df: pd.DataFrame, arm_models: dict = None) -> pd.DataF
 
 
 def untag_high_ivb_sweepers(df: pd.DataFrame) -> pd.DataFrame:
-    """Map 'STH' back to 'ST' for display."""
     df = df.copy()
     df.loc[df["pitch_type"] == "STH", "pitch_type"] = "ST"
     return df
 
 
 # ─── RANK NORMALIZATION (per pitch type) ─────────────────────────────────────
-# Compute percentile WITHIN each pitch type, then map to N(100,10).
-# This ensures avg FF = avg CH = 100, preventing systematic inflation/deflation
-# due to different number of scoring dimensions per pitch type.
 
 def fit_rank_norm(raw: np.ndarray, pitch_types: np.ndarray = None) -> dict:
     if pitch_types is None:
-        # Global fallback
         return {"_global": np.sort(raw)}
     rn = {}
     for pt in np.unique(pitch_types):
@@ -546,7 +632,6 @@ def apply_rank_norm(raw: np.ndarray, rn: dict,
             0.001, 0.999
         )
         out[mask] = 100.0 + 10.0 * scipy_stats.norm.ppf(pct)
-    # Fallback for unseen pitch types: use global percentile across all types
     seen = set(rn.keys()) if pitch_types is not None else set()
     if pitch_types is not None:
         unseen = ~np.isin(pitch_types, list(seen))
@@ -578,7 +663,7 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
                           arm_models=None, haa_stats=None):
     df = df.copy()
 
-    # VAA / HAA
+    # VAA / HAA (correct kinematic formula)
     vaa, haa = compute_vaa_haa(df)
     df["_vaa"] = vaa
     df["_haa"] = haa
@@ -590,7 +675,10 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
     df["ivb"] = df["pfx_z"] * 12.0
     df["hb"]  = df["pfx_x"] * 12.0
 
-    # Spin axis as number (keep original spin_axis string/col intact for display)
+    # Fix HB sign: positive = arm side for both handedness
+    df = fix_hb_handedness(df)
+
+    # Spin axis as number
     if "spin_axis" in df.columns:
         df["spin_axis_num"] = pd.to_numeric(df["spin_axis"], errors="coerce")
 
@@ -598,13 +686,9 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
     if "release_extension" not in df.columns:
         df["release_extension"] = 6.2
 
-    # Arm angle (degrees, 0=sidearm, 90=over-top)
-    df["arm_angle"] = np.degrees(
-        np.arctan2(df["release_pos_z"].values - 5.5,
-                   np.abs(df["release_pos_x"].values))
-    )
+    # Arm angle (corrected for handedness)
+    df["arm_angle"] = compute_arm_angle(df)
 
-    # Calibrate from data if not provided
     if league_stats is None:
         league_stats = fit_league_stats(df)
     if arm_models is None:
@@ -612,7 +696,6 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
     if haa_stats is None:
         haa_stats = fit_haa_stats(df)
 
-    # Fastball reference per pitcher (uses index-lookup, no merge collision)
     df = compute_fb_reference(df)
 
     return df, vaa_coeffs, league_stats, arm_models, haa_stats
@@ -621,7 +704,6 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
 # ─── TRAIN ────────────────────────────────────────────────────────────────────
 
 def train(df, status_fn=None):
-    # Filter out rows with null/empty pitch_type (Savant data has these)
     df = df.copy()
     df["pitch_type"] = df["pitch_type"].fillna("").astype(str).str.strip()
     df = df[df["pitch_type"].str.len() > 0].reset_index(drop=True)
@@ -686,17 +768,16 @@ def load_model():
                 am  = aux.get("arm_models")
                 hs  = aux.get("haa_stats")
         except Exception:
-            pass  # aux params optional — scoring still works without them
+            pass
     return rn, vc, lg, am, hs
 
 
-# Columns that get recomputed fresh — strip before re-running features
 _DROP_BEFORE_SCORE = [
     "arm_angle", "spin_axis_num",
     "fb_ivb", "fb_hb", "fb_velo", "fb_vaa",
-    "_vaa", "_haa",            # recomputed from velocity vectors
-    "adj_vaa",                  # recomputed from _vaa
-    "ivb", "hb",                # recomputed from pfx
+    "_vaa", "_haa",
+    "adj_vaa",
+    "ivb", "hb",
 ]
 
 
@@ -705,7 +786,6 @@ def score(df, rank_norm=None, vaa_coeffs=None, league_stats=None,
     if rank_norm is None:
         rank_norm, vaa_coeffs, league_stats, arm_models, haa_stats = load_model()
 
-    # Filter out rows with null/empty pitch_type
     df = df.copy()
     df["pitch_type"] = df["pitch_type"].fillna("").astype(str).str.strip()
     df = df[df["pitch_type"].str.len() > 0].reset_index(drop=True)
