@@ -258,13 +258,32 @@ def fit_league_stats(df: pd.DataFrame) -> dict:
             v = grp[col].dropna() if col in grp.columns else pd.Series(dtype=float)
             return (float(v.mean()), max(float(v.std()), 0.01)) if len(v) >= 30 \
                    else (fm, fs)
+
+        # Per-type combined movement and balance — so every z-score comparison
+        # is vs pitches of the SAME TYPE, not a shared hardcoded constant.
+        ivb_v  = grp["ivb"].dropna() if "ivb" in grp.columns else pd.Series(dtype=float)
+        hb_v   = grp["hb"].dropna()  if "hb"  in grp.columns else pd.Series(dtype=float)
+        if len(ivb_v) >= 30 and len(hb_v) >= 30:
+            n       = min(len(ivb_v), len(hb_v))
+            comb_v  = np.sqrt(ivb_v.values[:n]**2 + hb_v.values[:n]**2)
+            max_ax  = np.maximum(np.abs(ivb_v.values[:n]), np.abs(hb_v.values[:n]))
+            min_ax  = np.minimum(np.abs(ivb_v.values[:n]), np.abs(hb_v.values[:n]))
+            bal_v   = np.where(max_ax > 0, min_ax / max_ax, 0.0)
+            comb_ms = (float(comb_v.mean()), max(float(comb_v.std()), 0.5))
+            bal_ms  = (float(bal_v.mean()),  max(float(bal_v.std()),  0.05))
+        else:
+            comb_ms = (COMB_MEAN.get(pt, 12.0), COMB_STD)
+            bal_ms  = (BALANCE_MEAN, BALANCE_STD)
+
         stats[pt] = {
-            "velo": ms("release_speed",    92.0,  2.0),
-            "ivb":  ms("ivb",             13.0,  3.5),
-            "hb":   ms("hb",               8.0,  3.5),
-            "vaa":  ms("adj_vaa",         -4.5,  0.8),
-            "ext":  ms("release_extension", 6.2,  0.3),
-            "spin": ms("release_spin_rate",2200., 300.),
+            "velo":    ms("release_speed",    92.0,  2.0),
+            "ivb":     ms("ivb",             13.0,  3.5),
+            "hb":      ms("hb",               8.0,  3.5),
+            "vaa":     ms("adj_vaa",         -4.5,  0.8),
+            "ext":     ms("release_extension", 6.2,  0.3),
+            "spin":    ms("release_spin_rate",2200., 300.),
+            "combined": comb_ms,   # (mean, std) of sqrt(iVB^2+HB^2) for THIS pitch type
+            "balance":  bal_ms,    # (mean, std) of min/max axis ratio for THIS pitch type
         }
     return stats
 
@@ -470,19 +489,24 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
         # Rewards total Magnus force vector magnitude (sqrt(iVB^2 + HB^2)) and
         # balance between axes. 12"+12" beats 7"+14" per the scouting principle
         # that multiple forces in opposite planes are harder to square up.
+        # Uses per-pitch-type mean/std from training data so every comparison
+        # is strictly vs pitches of the SAME TYPE.
         if "combined" in w:
-            total_mv  = np.sqrt(ivb_vals**2 + hb_vals**2)
-            comb_mean = COMB_MEAN.get(pt, 12.0)
-            comb_z    = (total_mv - comb_mean) / COMB_STD
+            total_mv   = np.sqrt(ivb_vals**2 + hb_vals**2)
+            comb_mean  = lg["combined"][0] if "combined" in lg else COMB_MEAN.get(pt, 12.0)
+            comb_std   = lg["combined"][1] if "combined" in lg else COMB_STD
+            comb_z     = (total_mv - comb_mean) / comb_std
             s += w["combined"] * _exp(comb_z)
 
         if "balance" in w:
-            abs_ivb  = np.abs(ivb_vals)
-            abs_hb   = np.abs(hb_vals)
-            max_axis = np.maximum(abs_ivb, abs_hb)
-            min_axis = np.minimum(abs_ivb, abs_hb)
-            balance  = np.where(max_axis > 0, min_axis / max_axis, 0.0)
-            bal_z    = (balance - BALANCE_MEAN) / BALANCE_STD
+            abs_ivb   = np.abs(ivb_vals)
+            abs_hb    = np.abs(hb_vals)
+            max_axis  = np.maximum(abs_ivb, abs_hb)
+            min_axis  = np.minimum(abs_ivb, abs_hb)
+            balance   = np.where(max_axis > 0, min_axis / max_axis, 0.0)
+            bal_mean  = lg["balance"][0] if "balance" in lg else BALANCE_MEAN
+            bal_std   = lg["balance"][1] if "balance" in lg else BALANCE_STD
+            bal_z     = (balance - bal_mean) / bal_std
             s += w["balance"] * _exp(bal_z)
 
         # ── HAA ─────────────────────────────────────────────────────────────
