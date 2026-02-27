@@ -89,14 +89,15 @@ def stuff_css(val):
 
 def make_movement_plot(mvmt, arm_angle, hand):
     """
-    Movement plot with correct HB orientation:
-      - X axis: arm side (positive) on the right, glove side on the left
-      - Arm angle line derived from the corrected arm_angle value
-      - Axis labels reflect the pitcher's handedness
+    Movement plot with one arm-angle line per pitch type, color-coded to match
+    the pitch scatter dots. Lines fan out from origin showing each pitch type's
+    average release slot — gaps between lines expose arm-angle cheating.
+
+    arm_angle: overall mean (used as fallback if per-pitch data missing)
     """
     fig = go.Figure()
 
-    # Reference circles
+    # ── Reference circles ────────────────────────────────────────────────────
     for r in [5, 10, 15, 20, 25]:
         t = np.linspace(0, 2 * np.pi, 120)
         fig.add_trace(go.Scatter(
@@ -107,7 +108,7 @@ def make_movement_plot(mvmt, arm_angle, hand):
     fig.add_hline(y=0, line_color='rgba(48,54,61,0.6)', line_width=1)
     fig.add_vline(x=0, line_color='rgba(48,54,61,0.6)', line_width=1)
 
-    # Clock labels
+    # ── Clock labels ─────────────────────────────────────────────────────────
     for deg, lbl in {0: '12', 90: '3', 180: '6', 270: '9'}.items():
         rad = math.radians(90 - deg)
         fig.add_annotation(
@@ -115,27 +116,56 @@ def make_movement_plot(mvmt, arm_angle, hand):
             font=dict(size=11, color='#484f58', family='JetBrains Mono'),
             showarrow=False)
 
-    # Arm angle line.
-    # arm_angle is now degrees from horizontal (0=sidearm, 90=over-top),
-    # corrected for handedness. We draw it on the arm-side (right side of plot
-    # since HB is arm-side positive).
-    # Convert: 0° arm angle = 9-o'clock direction = 180° standard angle
-    # As arm_angle increases toward 90° (over-top), line rotates toward 12 o'clock.
-    # The line should always point toward the arm-side half of the plot (+x).
-    line_angle_rad = math.radians(arm_angle)  # from horizontal
-    lx = 23 * math.cos(line_angle_rad)
-    ly = 23 * math.sin(line_angle_rad)
-    fig.add_trace(go.Scatter(
-        x=[0, lx], y=[0, ly], mode='lines',
-        line=dict(color='#ffa657', width=2, dash='dot'),
-        showlegend=False, hoverinfo='skip'))
+    # ── Per-pitch-type arm angle lines ────────────────────────────────────────
+    # Compute mean arm_angle per pitch type from the per-pitch column if available.
+    # Line length scales slightly with pitch usage (more pitches = longer line),
+    # making the dominant pitch type's line the most prominent.
+    pitch_types_ordered = [pt for pt in mvmt['pitch_type'].unique()
+                           if not pd.isna(pt)]
+    has_per_pitch_aa = 'arm_angle' in mvmt.columns
 
-    # Pitch scatter — hb is already arm-side-positive in the data
-    for pt in mvmt['pitch_type'].unique():
-        if pd.isna(pt):
-            continue
-        s = mvmt[mvmt['pitch_type'] == pt]
-        c = PITCH_COLORS.get(pt, '#7d8590')
+    # Collect per-pitch-type angles for the annotation table
+    pt_angles = {}
+    for pt in pitch_types_ordered:
+        sub = mvmt[mvmt['pitch_type'] == pt]
+        if has_per_pitch_aa:
+            aa = sub['arm_angle'].dropna().mean()
+        else:
+            aa = arm_angle  # fallback: single overall angle
+        if np.isfinite(aa):
+            pt_angles[pt] = round(aa, 1)
+
+    # Draw lines — longer for dominant pitch types
+    total_pitches = len(mvmt)
+    for pt, aa in pt_angles.items():
+        sub   = mvmt[mvmt['pitch_type'] == pt]
+        frac  = len(sub) / max(total_pitches, 1)
+        # Line length: 16 (rare pitch) to 23 (dominant pitch)
+        length = 16 + 7 * frac
+        rad    = math.radians(aa)
+        lx     = length * math.cos(rad)
+        ly     = length * math.sin(rad)
+        color  = PITCH_COLORS.get(pt, '#7d8590')
+        nm     = PITCH_NAMES.get(pt, pt)
+
+        fig.add_trace(go.Scatter(
+            x=[0, lx], y=[0, ly], mode='lines',
+            name=f'{nm} arm',
+            line=dict(color=color, width=2, dash='dot'),
+            showlegend=False,
+            hovertemplate=f'<b>{nm}</b><br>Arm Angle: {aa}°<extra></extra>'))
+
+        # Angle label at tip of line
+        fig.add_annotation(
+            x=lx * 1.08, y=ly * 1.08,
+            text=f'{aa}°',
+            font=dict(size=8, color=color, family='JetBrains Mono'),
+            showarrow=False, bgcolor='rgba(13,17,23,0.75)')
+
+    # ── Pitch scatter ─────────────────────────────────────────────────────────
+    for pt in pitch_types_ordered:
+        s  = mvmt[mvmt['pitch_type'] == pt]
+        c  = PITCH_COLORS.get(pt, '#7d8590')
         nm = PITCH_NAMES.get(pt, pt)
         fig.add_trace(go.Scatter(
             x=s['hb'], y=s['ivb'], mode='markers', name=nm,
@@ -143,10 +173,7 @@ def make_movement_plot(mvmt, arm_angle, hand):
                         line=dict(width=0.4, color='rgba(0,0,0,0.4)')),
             hovertemplate=f'<b>{nm}</b><br>HB: %{{x:.1f}}"<br>iVB: %{{y:.1f}}"<extra></extra>'))
 
-    # Axis labels — arm side is always right (+x), glove side always left (-x)
-    arm_label  = "Arm Side →"
-    glove_label = "← Glove Side"
-
+    # ── Layout ────────────────────────────────────────────────────────────────
     fig.update_layout(
         template='plotly_dark', paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
         font=dict(family='JetBrains Mono', color='#7d8590', size=10),
@@ -154,7 +181,7 @@ def make_movement_plot(mvmt, arm_angle, hand):
             text='<b>Pitch Movement</b>',
             font=dict(size=14, color='#e6edf3', family='DM Sans'), x=0.01, y=0.98),
         xaxis=dict(
-            title=f'{glove_label}  |  {arm_label}',
+            title='← Glove Side  |  Arm Side →',
             range=[-28, 28], zeroline=False,
             gridcolor='rgba(33,38,45,0.3)', dtick=10),
         yaxis=dict(
@@ -166,14 +193,7 @@ def make_movement_plot(mvmt, arm_angle, hand):
             orientation='h', y=-0.17, x=0.5, xanchor='center',
             font=dict(size=9), bgcolor='rgba(0,0,0,0)'),
         margin=dict(l=50, r=15, t=42, b=55),
-        height=500, width=500,
-        annotations=[dict(
-            x=0.98, y=0.02, xref='paper', yref='paper',
-            text=f'<b>Arm Angle: {arm_angle}°</b>',
-            font=dict(size=10, color='#ffa657', family='JetBrains Mono'),
-            showarrow=False, bgcolor='rgba(13,17,23,0.85)',
-            bordercolor='#ffa657', borderwidth=1, borderpad=4,
-            xanchor='right', yanchor='bottom')])
+        height=500, width=500)
     return fig
 
 
