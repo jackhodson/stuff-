@@ -252,24 +252,35 @@ def build_pitcher_summary(df, pitcher_id=None):
     # ── Movement data for plot ────────────────────────────────────────────────
     # hb is already arm-side-positive from the scoring pipeline
     mvmt_cols = ['pitch_type']
-    if 'ivb' in pdf.columns: mvmt_cols.append('ivb')
-    if 'hb'  in pdf.columns: mvmt_cols.append('hb')
-    mvmt = pdf[mvmt_cols].copy().dropna()
+    if 'ivb'       in pdf.columns: mvmt_cols.append('ivb')
+    if 'hb'        in pdf.columns: mvmt_cols.append('hb')
+    if 'arm_angle' in pdf.columns: mvmt_cols.append('arm_angle')
+    mvmt = pdf[mvmt_cols].copy().dropna(subset=['ivb', 'hb'])
+
+    # Per-pitch-type arm angles — used for arm-angle-cheating penalty in scoring
+    # and for per-line display on the movement plot
+    arm_angles_by_pitch = {}
+    if 'arm_angle' in pdf.columns:
+        for pt, grp in pdf.groupby('pitch_type'):
+            aa = grp['arm_angle'].dropna().mean()
+            if np.isfinite(aa):
+                arm_angles_by_pitch[pt] = round(aa, 1)
 
     return {
-        'header_table':  header_df,
-        'usage_lhh':     usage_lhh,
-        'usage_rhh':     usage_rhh,
-        'metrics_table': metrics_df,
-        'movement_data': mvmt,
-        'arm_angle':     round(pdf['arm_angle'].mean(), 1)
-                         if 'arm_angle' in pdf.columns else 45.0,
-        'pitcher_name':  pitcher_name,
-        'pitcher_hand':  pitcher_hand,
-        'total_pitches': total,
-        'overall_zone':  overall_zone,
-        'overall_chase': overall_chase,
-        'overall_whiff': overall_whiff,
-        'overall_xwoba': overall_xwoba,
-        'overall_stuff': overall_stuff,
+        'header_table':       header_df,
+        'usage_lhh':          usage_lhh,
+        'usage_rhh':          usage_rhh,
+        'metrics_table':      metrics_df,
+        'movement_data':      mvmt,
+        'arm_angle':          round(pdf['arm_angle'].mean(), 1)
+                              if 'arm_angle' in pdf.columns else 45.0,
+        'arm_angles_by_pitch': arm_angles_by_pitch,
+        'pitcher_name':       pitcher_name,
+        'pitcher_hand':       pitcher_hand,
+        'total_pitches':      total,
+        'overall_zone':       overall_zone,
+        'overall_chase':      overall_chase,
+        'overall_whiff':      overall_whiff,
+        'overall_xwoba':      overall_xwoba,
+        'overall_stuff':      overall_stuff,
     }
