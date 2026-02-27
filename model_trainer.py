@@ -49,15 +49,18 @@ WEIGHTS = {
     "FF": {"velo":2.5, "ivb":1.8, "hb":0.6, "vaa":1.5, "ext":0.8, "spin":0.8},
     "SI": {"velo":2.0, "si_depth":2.0, "hb_run":2.5, "vaa":0.5, "ext":0.5, "spin":0.4},
     "FC": {"velo":2.2, "ivb":1.2, "hb":0.8, "vaa":0.8, "ext":0.5, "spin":0.6},
-    "CH": {"tunnel":3.0, "velo_gap":1.5, "hb_tunnel":2.0},
-    "FS": {"tunnel":2.5, "velo_gap":2.0, "hb_tunnel":1.5},
-    "FO": {"tunnel":2.5, "velo_gap":1.5, "hb_tunnel":1.5},
-    "CU": {"velo":2.0, "ivb":2.2, "hb":1.0, "vaa":0.8, "spin":1.0},
-    "KC": {"velo":2.0, "ivb":2.2, "hb":1.2, "vaa":0.8, "spin":1.0},
-    "SL": {"velo":1.8, "ivb":1.2, "hb":2.2, "haa":0.8, "vaa":0.5, "spin":0.8},
-    "ST": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8},
-    "SW": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8},
-    "SV": {"velo":1.8, "ivb":1.5, "hb":2.0, "vaa":0.5, "spin":0.8},
+    # Offspeed: ext contributes via reduced reaction time; lower weight because
+    # tunneling dims (velo_gap/tunnel/hb_tunnel) already capture most deception
+    "CH": {"tunnel":3.0, "velo_gap":1.5, "hb_tunnel":2.0, "ext":0.3},
+    "FS": {"tunnel":2.5, "velo_gap":2.0, "hb_tunnel":1.5, "ext":0.3},
+    "FO": {"tunnel":2.5, "velo_gap":1.5, "hb_tunnel":1.5, "ext":0.3},
+    # Breaking balls: ext improves FB tunneling window + reduces reaction time
+    "CU": {"velo":2.0, "ivb":2.2, "hb":1.0, "vaa":0.8, "spin":1.0, "ext":0.4},
+    "KC": {"velo":2.0, "ivb":2.2, "hb":1.2, "vaa":0.8, "spin":1.0, "ext":0.4},
+    "SL": {"velo":1.8, "ivb":1.2, "hb":2.2, "haa":0.8, "vaa":0.5, "spin":0.8, "ext":0.4},
+    "ST": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8, "ext":0.4},
+    "SW": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8, "ext":0.4},
+    "SV": {"velo":1.8, "ivb":1.5, "hb":2.0, "vaa":0.5, "spin":0.8, "ext":0.4},
 }
 
 GYRO_WEIGHTS = {
@@ -179,13 +182,21 @@ def apply_vaa_adjustment(df, coeffs):
 
 def fix_hb_handedness(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Flip HB sign for LHP so that positive = arm side for both handedness.
-    Operates on the 'hb' column (already converted to inches from pfx_x).
+    Normalize HB so that positive = arm side for both handedness.
+
+    Statcast pfx_x uses PITCHER'S perspective:
+      positive = toward first base from pitcher's view
+               = LHP arm side  /  RHP glove side
+      negative = toward third base from pitcher's view
+               = RHP arm side  /  LHP glove side
+
+    To make arm-side positive for BOTH: flip RHP (not LHP).
+    LHP arm-side is already positive; RHP arm-side is negative and needs negation.
     """
     df = df.copy()
     if "p_throws" in df.columns and "hb" in df.columns:
-        lhp_mask = df["p_throws"] == "L"
-        df.loc[lhp_mask, "hb"] = -df.loc[lhp_mask, "hb"]
+        rhp_mask = df["p_throws"] == "R"
+        df.loc[rhp_mask, "hb"] = -df.loc[rhp_mask, "hb"]
     return df
 
 
@@ -209,17 +220,16 @@ def fix_hb_handedness(df: pd.DataFrame) -> pd.DataFrame:
 def compute_arm_angle(df: pd.DataFrame) -> np.ndarray:
     """
     Return arm angle in degrees (0=sidearm, ~60=over-top).
-    Matches the scale of Statcast's published arm angle metric.
-    No handedness flip required — abs(release_pos_x) handles both RHP and LHP.
+    Calibrated to minimize error vs Savant published arm angles across
+    sidearm, low-3/4, 3/4, high-3/4, and over-the-top slots for both RHP and LHP.
+
+    Z_REF = 4.9 ft (empirically best fit vs known values)
+    abs(release_pos_x) handles both RHP (negative rx) and LHP (positive rx).
     """
+    Z_REF = 4.9
     rx = df["release_pos_x"].values.astype(float)
     rz = df["release_pos_z"].values.astype(float)
-
-    # abs(rx) = horizontal distance from center, regardless of handedness
-    # 5.0 ft baseline: the approximate height at which arm angle = 0° (horizontal)
-    arm_angle = np.degrees(np.arctan2(rz - 5.0, np.abs(rx)))
-
-    # Clip to valid range
+    arm_angle = np.degrees(np.arctan2(rz - Z_REF, np.abs(rx)))
     arm_angle = np.clip(arm_angle, 0.0, 90.0)
     return arm_angle
 
@@ -939,6 +949,52 @@ _DROP_BEFORE_SCORE = [
 ]
 
 
+_FB_TYPES = frozenset({"FF", "SI", "FC"})
+
+def arm_angle_cheat_penalty(df: pd.DataFrame, scores: np.ndarray) -> np.ndarray:
+    """
+    Penalize pitch types where the pitcher cheats their arm slot vs their fastball.
+
+    Method:
+      - Reference = mean arm angle of all fastballs (FF/SI/FC) thrown by that pitcher
+        (falls back to overall mean if no fastball data)
+      - For each non-FB pitch type, compute: deviation = |type_mean_aa - fb_ref_aa|
+      - Apply a flat penalty to every pitch of that type, scaled linearly from
+        0 pts at 2° deviation (normal release variance) to 5 pts at 8° deviation
+
+    This rewards pitchers who maintain arm slot across all pitch types and penalizes
+    those who drop/raise their arm to manufacture extra movement — making the
+    visual fan of lines on the movement plot directly correspond to score impact.
+    """
+    if "arm_angle" not in df.columns or "pitcher" not in df.columns:
+        return scores
+
+    scores  = scores.copy()
+    GRACE   = 2.0   # degrees — no penalty within this window
+    MAX_DEV = 8.0   # degrees — full penalty at this deviation
+    MAX_PEN = 5.0   # Stuff+ points — maximum penalty
+
+    for pid, grp in df.groupby("pitcher"):
+        fb_mask = grp["pitch_type"].isin(_FB_TYPES)
+        ref_aa  = grp.loc[fb_mask, "arm_angle"].mean() if fb_mask.sum() >= 5 \
+                  else grp["arm_angle"].mean()
+        if not np.isfinite(ref_aa):
+            continue
+
+        # Per pitch-type mean, then apply flat penalty to all pitches of that type
+        for pt, pt_grp in grp.groupby("pitch_type"):
+            type_mean_aa = pt_grp["arm_angle"].dropna().mean()
+            if not np.isfinite(type_mean_aa):
+                continue
+            deviation = abs(type_mean_aa - ref_aa)
+            penalty   = 0.0 if deviation <= GRACE else \
+                        min((deviation - GRACE) / (MAX_DEV - GRACE), 1.0) * MAX_PEN
+            if penalty > 0:
+                scores[pt_grp.index] -= penalty
+
+    return scores
+
+
 def score(df, rank_norm=None, vaa_coeffs=None, league_stats=None,
           arm_models=None, haa_stats=None, **_):
     if rank_norm is None:
@@ -958,6 +1014,7 @@ def score(df, rank_norm=None, vaa_coeffs=None, league_stats=None,
     df     = tag_high_ivb_sweepers(df, arm_models=am)
     s      = apply_rank_norm(raw, rank_norm, df["pitch_type"].values)
     s      = apply_velo_floor(s, df)
+    s      = arm_angle_cheat_penalty(df, s)   # ← penalize arm-angle cheating
     df     = untag_high_ivb_sweepers(df)
 
     df = df.copy()
