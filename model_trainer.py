@@ -47,21 +47,34 @@ GYRO_SL_TYPES  = {"SL", "ST", "SW"}
 # ─── DIMENSION WEIGHTS ────────────────────────────────────────────────────────
 WEIGHTS = {
     "FF": {"velo":2.5, "ivb":1.8, "hb":0.6, "vaa":1.5, "ext":0.8, "spin":0.8},
-    "SI": {"velo":2.0, "si_depth":2.0, "hb_run":2.5, "vaa":0.5, "ext":0.5, "spin":0.4},
+    # SI: tightened weights to prevent over-grading mediocre sinkers
+    "SI": {"velo":2.0, "si_depth":1.8, "hb_run":1.8, "vaa":0.5, "ext":0.5, "spin":0.4},
     "FC": {"velo":2.2, "ivb":1.2, "hb":0.8, "vaa":0.8, "ext":0.5, "spin":0.6},
-    # Offspeed: ext contributes via reduced reaction time; lower weight because
-    # tunneling dims (velo_gap/tunnel/hb_tunnel) already capture most deception
     "CH": {"tunnel":3.0, "velo_gap":1.5, "hb_tunnel":2.0, "ext":0.3},
     "FS": {"tunnel":2.5, "velo_gap":2.0, "hb_tunnel":1.5, "ext":0.3},
     "FO": {"tunnel":2.5, "velo_gap":1.5, "hb_tunnel":1.5, "ext":0.3},
-    # Breaking balls: ext improves FB tunneling window + reduces reaction time
-    "CU": {"velo":2.0, "ivb":2.2, "hb":1.0, "vaa":0.8, "spin":1.0, "ext":0.4},
-    "KC": {"velo":2.0, "ivb":2.2, "hb":1.2, "vaa":0.8, "spin":1.0, "ext":0.4},
-    "SL": {"velo":1.8, "ivb":1.2, "hb":2.2, "haa":0.8, "vaa":0.5, "spin":0.8, "ext":0.4},
-    "ST": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8, "ext":0.4},
-    "SW": {"velo":1.8, "ivb":0.8, "hb":2.8, "haa":1.5, "vaa":0.3, "spin":0.8, "ext":0.4},
-    "SV": {"velo":1.8, "ivb":1.5, "hb":2.0, "vaa":0.5, "spin":0.8, "ext":0.4},
+    # CU: pure depth weapon — 12-6 power curve, individual axis scoring correct
+    "CU": {"velo":2.0, "ivb":2.2, "hb":0.8, "vaa":0.8, "spin":1.0, "ext":0.4},
+    # KC: hybrid curve/slider — COMBINED total movement + balance bonus
+    #     Nola/Soriano (14+4, 16+3) grade as +; balanced 12+12 grades elite
+    "KC": {"velo":2.0, "combined":2.5, "balance":0.6, "vaa":0.8, "spin":0.8, "ext":0.4},
+    # SL: combined movement primary — 12+12 beats 7+14 (balance bonus)
+    "SL": {"velo":1.8, "combined":2.0, "balance":1.0, "haa":0.8, "vaa":0.5, "spin":0.6, "ext":0.4},
+    # ST/SW: sweepers — combined rewarded, HAA dominant for horizontal approach
+    "ST": {"velo":1.8, "combined":1.8, "balance":0.5, "haa":1.5, "vaa":0.3, "spin":0.6, "ext":0.4},
+    "SW": {"velo":1.8, "combined":1.8, "balance":0.5, "haa":1.5, "vaa":0.3, "spin":0.6, "ext":0.4},
+    # SV: slurve — highest balance weight, the quintessential 12-12 pitch type
+    "SV": {"velo":1.8, "combined":2.8, "balance":1.5, "vaa":0.5, "spin":0.6, "ext":0.4},
 }
+
+# ─── COMBINED MOVEMENT CONSTANTS ─────────────────────────────────────────────
+# For pitch types with "combined" key: score = f(sqrt(iVB^2 + HB^2))
+# Principle: total Magnus force vector; 12"+12" beats 7"+14" — multiple forces
+# in opposite planes are harder to square up. Balance ratio = min/max of axes.
+COMB_MEAN    = {"KC":11.0, "SL":12.0, "ST":14.0, "SW":14.0, "SV":12.5}
+COMB_STD     = 3.5
+BALANCE_MEAN = 0.35   # typical breaking ball balance ratio
+BALANCE_STD  = 0.25
 
 GYRO_WEIGHTS = {
     "velo":    2.0,
@@ -433,7 +446,6 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
         if "hb_run" in w:
             SI_HB_MEAN = 13.0
             SI_HB_STD  = 2.5
-            # hb_vals already arm-side-positive; sinker arm-side run = positive hb
             hb_run_z = (hb_vals - SI_HB_MEAN) / SI_HB_STD
             s += w["hb_run"] * _exp(hb_run_z)
 
@@ -448,9 +460,30 @@ def compute_stuff_raw(df: pd.DataFrame, league_stats: dict,
             s += w["si_depth"] * _exp(depth_z)
 
             if "hb_run" in w:
-                both_elite   = (depth_z > 0.5) & (hb_vals > 16.0)
-                outlier_z    = np.minimum(depth_z, (hb_vals - 16.0) / 2.0)
+                # Both-elite bonus: require TRULY elite run (>19") AND meaningful depth
+                # Old threshold (16") was too low — caused average sinkers to over-grade
+                both_elite = (depth_z > 0.5) & (hb_vals > 19.0)
+                outlier_z  = np.minimum(depth_z, (hb_vals - 19.0) / 2.0)
                 s += both_elite.astype(float) * 1.0 * np.clip(_exp(outlier_z), 0, 3)
+
+        # ── Combined movement: KC / SL / ST / SW / SV ─────────────────────
+        # Rewards total Magnus force vector magnitude (sqrt(iVB^2 + HB^2)) and
+        # balance between axes. 12"+12" beats 7"+14" per the scouting principle
+        # that multiple forces in opposite planes are harder to square up.
+        if "combined" in w:
+            total_mv  = np.sqrt(ivb_vals**2 + hb_vals**2)
+            comb_mean = COMB_MEAN.get(pt, 12.0)
+            comb_z    = (total_mv - comb_mean) / COMB_STD
+            s += w["combined"] * _exp(comb_z)
+
+        if "balance" in w:
+            abs_ivb  = np.abs(ivb_vals)
+            abs_hb   = np.abs(hb_vals)
+            max_axis = np.maximum(abs_ivb, abs_hb)
+            min_axis = np.minimum(abs_ivb, abs_hb)
+            balance  = np.where(max_axis > 0, min_axis / max_axis, 0.0)
+            bal_z    = (balance - BALANCE_MEAN) / BALANCE_STD
+            s += w["balance"] * _exp(bal_z)
 
         # ── HAA ─────────────────────────────────────────────────────────────
         # HAA is computed via the correct Statcast kinematic formula (same t as VAA).
