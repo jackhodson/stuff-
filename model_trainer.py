@@ -697,7 +697,11 @@ def add_physics_features(df, vaa_coeffs=None, league_stats=None,
         df["release_extension"] = 6.2
 
     # Arm angle (corrected for handedness)
-    df["arm_angle"] = compute_arm_angle(df)
+    # Arm angle: use Savant's column directly if present (shoulder-to-ball geometry,
+    # exactly matching the published leaderboard values). Only fall back to our
+    # geometric approximation when the column is missing (e.g. CSV uploads without it).
+    if "arm_angle" not in df.columns:
+        df["arm_angle"] = compute_arm_angle(df)
 
     if league_stats is None:
         league_stats = fit_league_stats(df)
@@ -774,7 +778,8 @@ def train_streaming(chunks, status_fn=None):
         chunk["ivb"] = chunk["pfx_z"] * 12.0
         chunk["hb"]  = chunk["pfx_x"] * 12.0
         chunk = fix_hb_handedness(chunk)
-        chunk["arm_angle"] = compute_arm_angle(chunk)
+        if "arm_angle" not in chunk.columns:
+            chunk["arm_angle"] = compute_arm_angle(chunk)
         if "release_extension" not in chunk.columns:
             chunk["release_extension"] = 6.2
 
@@ -941,11 +946,15 @@ def load_model():
 
 
 _DROP_BEFORE_SCORE = [
-    "arm_angle", "spin_axis_num",
+    "spin_axis_num",
     "fb_ivb", "fb_hb", "fb_velo", "fb_vaa",
     "_vaa", "_haa",
     "adj_vaa",
     "ivb", "hb",
+    # NOTE: arm_angle is intentionally NOT dropped here.
+    # The Statcast CSV includes an 'arm_angle' column computed by Savant from
+    # shoulder-to-ball geometry — that is the correct value and we preserve it.
+    # compute_arm_angle() is only used as a fallback when the column is absent.
 ]
 
 
