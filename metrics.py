@@ -38,12 +38,43 @@ def train_model(df, status_fn=None):
     return model_trainer.train(df, status_fn=status_fn)
 
 
+def train_model_streaming(chunks, status_fn=None):
+    """Train on a list of chunk DataFrames without loading the full season into RAM."""
+    return model_trainer.train_streaming(chunks, status_fn=status_fn)
+
+
 def score_pitches(df):
     return model_trainer.score(df)
 
 
 def score_from_csv(df):
     return model_trainer.score_from_csv(df)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _spin_axis_to_clock(degrees: float) -> str:
+    """
+    Convert spin axis in degrees to clock-face notation.
+    Per Statcast: 180° = 12:00, each hour = 30°.
+    Formula: Clock Hour = (spin_axis / 30 + 6) mod 12
+    Returns string like '12:00', '1:30', '6:00' etc.
+    """
+    if degrees is None or (isinstance(degrees, float) and np.isnan(degrees)):
+        return chr(8212)
+    # Total clock-minutes from 12:00
+    total_hours    = (degrees / 30.0 + 6.0) % 12.0
+    hour_part      = int(total_hours)
+    minute_part    = int(round((total_hours - hour_part) * 60))
+    # Handle 60-minute rollover
+    if minute_part == 60:
+        hour_part  += 1
+        minute_part = 0
+    if hour_part == 0:
+        hour_part   = 12
+    return f"{hour_part}:{minute_part:02d}"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -146,7 +177,7 @@ def build_pitcher_summary(df, pitcher_id=None):
             'hRel':     round(sub['release_pos_x'].mean(), 1),
             'Ext.':     round(sub['release_extension'].mean(), 1)
                         if 'release_extension' in sub.columns else chr(8212),
-            'Axis':     int(round(sub['spin_axis_num'].mean())) if has_axis else chr(8212),
+            'Axis':     _spin_axis_to_clock(sub['spin_axis_num'].mean()) if has_axis else chr(8212),
             # Column keyed as 'Stuff+' for render_header_table
             'Stuff+':   stuff_val,
         })
